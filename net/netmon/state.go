@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/wlynxg/anet"
 	"tailscale.com/envknob"
 	"tailscale.com/hostinfo"
 	"tailscale.com/net/netaddr"
@@ -139,7 +140,8 @@ func (i Interface) Addrs() ([]net.Addr, error) {
 	if i.AltAddrs != nil {
 		return i.AltAddrs, nil
 	}
-	return i.Interface.Addrs()
+
+	return anet.InterfaceAddrsByInterface(i.Interface)
 }
 
 // ForeachInterfaceAddress is a wrapper for GetList, then
@@ -693,7 +695,7 @@ func netInterfaces() ([]Interface, error) {
 	if altNetInterfaces != nil {
 		return altNetInterfaces()
 	}
-	ifs, err := net.Interfaces()
+	ifs, err := anet.Interfaces()
 	if err != nil {
 		return nil, err
 	}

@@ -92,6 +92,7 @@ require (
 	github.com/toqueteos/webbrowser v1.2.0
 	github.com/u-root/u-root v0.12.0
 	github.com/vishvananda/netns v0.0.4
+	github.com/wlynxg/anet v0.0.5
 	go.uber.org/zap v1.27.0
 	go4.org/mem v0.0.0-20220726221520-4f986261bf13
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
