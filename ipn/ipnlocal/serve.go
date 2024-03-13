@@ -62,7 +62,7 @@ type serveHTTPContext struct {
 //
 // This is not used in userspace-networking mode.
 //
-// localListener is used by tailscale serve (TCP only) as well as the built-in web client.
+// localListener is used by tailscale serve (TCP only), the built-in web client and tailfs.
 // Most serve traffic and peer traffic for the web client are intercepted by netstack.
 // This listener exists purely for connections from the machine itself, as that goes via the kernel,
 // so we need to be in the kernel's listening/routing tables.
@@ -222,7 +222,7 @@ func (b *LocalBackend) updateServeTCPPortNetMapAddrListenersLocked(ports []uint1
 	}
 
 	addrs := nm.GetAddresses()
-	for i := range addrs.LenIter() {
+	for i := range addrs.Len() {
 		a := addrs.At(i)
 		for _, p := range ports {
 			addrPort := netip.AddrPortFrom(a.Addr(), p)
@@ -605,7 +605,20 @@ func (rp *reverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := &httputil.ReverseProxy{Rewrite: func(r *httputil.ProxyRequest) {
+		oldOutPath := r.Out.URL.Path
 		r.SetURL(rp.url)
+
+		// If mount point matches the request path exactly, the outbound
+		// request URL was set to empty string in serveWebHandler which
+		// would have resulted in the outbound path set to <proxy path>
+		// + '/' in SetURL. In that case, if the proxy path was set, we
+		// want to send the request to the <proxy path> (without the
+		// '/') .
+		if oldOutPath == "" && rp.url.Path != "" {
+			r.Out.URL.Path = rp.url.Path
+			r.Out.URL.RawPath = rp.url.RawPath
+		}
+
 		r.Out.Host = r.In.Host
 		addProxyForwardedHeaders(r)
 		rp.lb.addTailscaleIdentityHeaders(r)

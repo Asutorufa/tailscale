@@ -18,7 +18,6 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -272,7 +271,7 @@ func (e *serveEnv) runServeCombined(subcmd serveMode) execFunc {
 			// if foreground mode, create a WatchIPNBus session
 			// and use the nested config for all following operations
 			// TODO(marwan-at-work): nested-config validations should happen here or previous to this point.
-			watcher, err = e.lc.WatchIPNBus(ctx, ipn.NotifyInitialState)
+			watcher, err = e.lc.WatchIPNBus(ctx, ipn.NotifyInitialState|ipn.NotifyNoPrivateKeys)
 			if err != nil {
 				return err
 			}
@@ -334,7 +333,7 @@ func (e *serveEnv) runServeCombined(subcmd serveMode) execFunc {
 const backgroundExistsMsg = "background configuration already exists, use `tailscale %s --%s=%d off` to remove the existing configuration"
 
 func (e *serveEnv) validateConfig(sc *ipn.ServeConfig, port uint16, wantServe serveType) error {
-	sc, isFg := findConfig(sc, port)
+	sc, isFg := sc.FindConfig(port)
 	if sc == nil {
 		return nil
 	}
@@ -364,24 +363,6 @@ func serveFromPortHandler(tcp *ipn.TCPPortHandler) serveType {
 	default:
 		return -1
 	}
-}
-
-// findConfig finds a config that contains the given port, which can be
-// the top level background config or an inner foreground one. The second
-// result is true if it's foreground
-func findConfig(sc *ipn.ServeConfig, port uint16) (*ipn.ServeConfig, bool) {
-	if sc == nil {
-		return nil, false
-	}
-	if _, ok := sc.TCP[port]; ok {
-		return sc, false
-	}
-	for _, sc := range sc.Foreground {
-		if _, ok := sc.TCP[port]; ok {
-			return sc, true
-		}
-	}
-	return nil, false
 }
 
 func (e *serveEnv) setServe(sc *ipn.ServeConfig, st *ipnstate.Status, dnsName string, srvType serveType, srvPort uint16, mount string, target string, allowFunnel bool) error {
@@ -535,7 +516,7 @@ func (e *serveEnv) applyWebServe(sc *ipn.ServeConfig, dnsName string, srvPort ui
 		}
 		h.Path = target
 	default:
-		t, err := expandProxyTargetDev(target, []string{"http", "https", "https+insecure"}, "http")
+		t, err := ipn.ExpandProxyTargetValue(target, []string{"http", "https", "https+insecure"}, "http")
 		if err != nil {
 			return err
 		}
@@ -547,29 +528,7 @@ func (e *serveEnv) applyWebServe(sc *ipn.ServeConfig, dnsName string, srvPort ui
 		return errors.New("cannot serve web; already serving TCP")
 	}
 
-	mak.Set(&sc.TCP, srvPort, &ipn.TCPPortHandler{HTTPS: useTLS, HTTP: !useTLS})
-
-	hp := ipn.HostPort(net.JoinHostPort(dnsName, strconv.Itoa(int(srvPort))))
-	if _, ok := sc.Web[hp]; !ok {
-		mak.Set(&sc.Web, hp, new(ipn.WebServerConfig))
-	}
-	mak.Set(&sc.Web[hp].Handlers, mount, h)
-
-	// TODO: handle multiple web handlers from foreground mode
-	for k, v := range sc.Web[hp].Handlers {
-		if v == h {
-			continue
-		}
-		// If the new mount point ends in / and another mount point
-		// shares the same prefix, remove the other handler.
-		// (e.g. /foo/ overwrites /foo)
-		// The opposite example is also handled.
-		m1 := strings.TrimSuffix(mount, "/")
-		m2 := strings.TrimSuffix(k, "/")
-		if m1 == m2 {
-			delete(sc.Web[hp].Handlers, k)
-		}
-	}
+	sc.SetWebHandler(h, dnsName, srvPort, mount, useTLS)
 
 	return nil
 }
@@ -585,7 +544,7 @@ func (e *serveEnv) applyTCPServe(sc *ipn.ServeConfig, dnsName string, srcType se
 		return fmt.Errorf("invalid TCP target %q", target)
 	}
 
-	targetURL, err := expandProxyTargetDev(target, []string{"tcp"}, "tcp")
+	targetURL, err := ipn.ExpandProxyTargetValue(target, []string{"tcp"}, "tcp")
 	if err != nil {
 		return fmt.Errorf("unable to expand target: %v", err)
 	}
@@ -600,11 +559,7 @@ func (e *serveEnv) applyTCPServe(sc *ipn.ServeConfig, dnsName string, srcType se
 		return fmt.Errorf("cannot serve TCP; already serving web on %d", srcPort)
 	}
 
-	mak.Set(&sc.TCP, srcPort, &ipn.TCPPortHandler{TCPForward: dstURL.Host})
-
-	if terminateTLS {
-		sc.TCP[srcPort].TerminateTLS = dnsName
-	}
+	sc.SetTCPForwarding(srcPort, dstURL.Host, terminateTLS, dnsName)
 
 	return nil
 }
@@ -618,14 +573,10 @@ func (e *serveEnv) applyFunnel(sc *ipn.ServeConfig, dnsName string, srvPort uint
 		sc = new(ipn.ServeConfig)
 	}
 
-	// TODO: should ensure there is no other conflicting funnel
-	// TODO: add error handling for if toggling for existing sc
-	if allowFunnel {
-		mak.Set(&sc.AllowFunnel, hp, true)
-	} else if _, exists := sc.AllowFunnel[hp]; exists {
-		fmt.Fprintf(e.stderr(), "Removing Funnel for %s\n", hp)
-		delete(sc.AllowFunnel, hp)
+	if _, exists := sc.AllowFunnel[hp]; exists && !allowFunnel {
+		fmt.Fprintf(e.stderr(), "Removing Funnel for %s:%s\n", dnsName, hp)
 	}
+	sc.SetFunnel(dnsName, srvPort, allowFunnel)
 }
 
 // unsetServe removes the serve config for the given serve port.
@@ -814,34 +765,7 @@ func (e *serveEnv) removeWebServe(sc *ipn.ServeConfig, dnsName string, srvPort u
 		}
 	}
 
-	// delete existing handler, then cascade delete if empty
-	for _, m := range mounts {
-		delete(sc.Web[hp].Handlers, m)
-	}
-	if len(sc.Web[hp].Handlers) == 0 {
-		delete(sc.Web, hp)
-		delete(sc.AllowFunnel, hp)
-		delete(sc.TCP, srvPort)
-	}
-
-	// clear empty maps mostly for testing
-	if len(sc.Web) == 0 {
-		sc.Web = nil
-	}
-
-	if len(sc.TCP) == 0 {
-		sc.TCP = nil
-	}
-
-	// disable funnel if no remaining mounts exist for the serve port
-	if sc.Web == nil && sc.TCP == nil {
-		delete(sc.AllowFunnel, hp)
-	}
-
-	if len(sc.AllowFunnel) == 0 {
-		sc.AllowFunnel = nil
-	}
-
+	sc.RemoveWebHandler(dnsName, srvPort, mounts, true)
 	return nil
 }
 
@@ -857,66 +781,8 @@ func (e *serveEnv) removeTCPServe(sc *ipn.ServeConfig, src uint16) error {
 	if sc.IsServingWeb(src) {
 		return fmt.Errorf("unable to remove; serving web, not TCP forwarding on serve port %d", src)
 	}
-	delete(sc.TCP, src)
-	// clear map mostly for testing
-	if len(sc.TCP) == 0 {
-		sc.TCP = nil
-	}
+	sc.RemoveTCPForwarding(src)
 	return nil
-}
-
-// expandProxyTargetDev expands the supported target values to be proxied
-// allowing for input values to be a port number, a partial URL, or a full URL
-// including a path.
-//
-// examples:
-//   - 3000
-//   - localhost:3000
-//   - tcp://localhost:3000
-//   - http://localhost:3000
-//   - https://localhost:3000
-//   - https-insecure://localhost:3000
-//   - https-insecure://localhost:3000/foo
-func expandProxyTargetDev(target string, supportedSchemes []string, defaultScheme string) (string, error) {
-	const host = "127.0.0.1"
-
-	// support target being a port number
-	if port, err := strconv.ParseUint(target, 10, 16); err == nil {
-		return fmt.Sprintf("%s://%s:%d", defaultScheme, host, port), nil
-	}
-
-	// prepend scheme if not present
-	if !strings.Contains(target, "://") {
-		target = defaultScheme + "://" + target
-	}
-
-	// make sure we can parse the target
-	u, err := url.ParseRequestURI(target)
-	if err != nil {
-		return "", fmt.Errorf("invalid URL %w", err)
-	}
-
-	// ensure a supported scheme
-	if !slices.Contains(supportedSchemes, u.Scheme) {
-		return "", fmt.Errorf("must be a URL starting with one of the supported schemes: %v", supportedSchemes)
-	}
-
-	// validate the host.
-	switch u.Hostname() {
-	case "localhost", "127.0.0.1":
-	default:
-		return "", errors.New("only localhost or 127.0.0.1 proxies are currently supported")
-	}
-
-	// validate the port
-	port, err := strconv.ParseUint(u.Port(), 10, 16)
-	if err != nil || port == 0 {
-		return "", fmt.Errorf("invalid port %q", u.Port())
-	}
-
-	u.Host = fmt.Sprintf("%s:%d", host, port)
-
-	return u.String(), nil
 }
 
 // cleanURLPath ensures the path is clean and has a leading "/".

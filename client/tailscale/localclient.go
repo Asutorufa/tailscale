@@ -7,6 +7,7 @@ package tailscale
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -34,10 +35,10 @@ import (
 	"tailscale.com/paths"
 	"tailscale.com/safesocket"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailfs"
 	"tailscale.com/tka"
 	"tailscale.com/types/key"
 	"tailscale.com/types/tkatype"
-	"tailscale.com/util/cmpx"
 )
 
 // defaultLocalClient is the default LocalClient when using the legacy
@@ -479,7 +480,7 @@ func (lc *LocalClient) DebugPortmap(ctx context.Context, opts *DebugPortmapOpts)
 		opts = &DebugPortmapOpts{}
 	}
 
-	vals.Set("duration", cmpx.Or(opts.Duration, 5*time.Second).String())
+	vals.Set("duration", cmp.Or(opts.Duration, 5*time.Second).String())
 	vals.Set("type", opts.Type)
 	vals.Set("log_http", strconv.FormatBool(opts.LogHTTP))
 
@@ -1415,6 +1416,57 @@ func (lc *LocalClient) CheckUpdate(ctx context.Context) (*tailcfg.ClientVersion,
 		return nil, err
 	}
 	return &cv, nil
+}
+
+// TailFSSetFileServerAddr instructs TailFS to use the server at addr to access
+// the filesystem. This is used on platforms like Windows and MacOS to let
+// TailFS know to use the file server running in the GUI app.
+func (lc *LocalClient) TailFSSetFileServerAddr(ctx context.Context, addr string) error {
+	_, err := lc.send(ctx, "PUT", "/localapi/v0/tailfs/fileserver-address", http.StatusCreated, strings.NewReader(addr))
+	return err
+}
+
+// TailFSShareSet adds or updates the given share in the list of shares that
+// TailFS will serve to remote nodes. If a share with the same name already
+// exists, the existing share is replaced/updated.
+func (lc *LocalClient) TailFSShareSet(ctx context.Context, share *tailfs.Share) error {
+	_, err := lc.send(ctx, "PUT", "/localapi/v0/tailfs/shares", http.StatusCreated, jsonBody(share))
+	return err
+}
+
+// TailFSShareRemove removes the share with the given name from the list of
+// shares that TailFS will serve to remote nodes.
+func (lc *LocalClient) TailFSShareRemove(ctx context.Context, name string) error {
+	_, err := lc.send(
+		ctx,
+		"DELETE",
+		"/localapi/v0/tailfs/shares",
+		http.StatusNoContent,
+		strings.NewReader(name))
+	return err
+}
+
+// TailFSShareRename renames the share from old to new name.
+func (lc *LocalClient) TailFSShareRename(ctx context.Context, oldName, newName string) error {
+	_, err := lc.send(
+		ctx,
+		"POST",
+		"/localapi/v0/tailfs/shares",
+		http.StatusNoContent,
+		jsonBody([2]string{oldName, newName}))
+	return err
+}
+
+// TailFSShareList returns the list of shares that TailFS is currently serving
+// to remote nodes.
+func (lc *LocalClient) TailFSShareList(ctx context.Context) ([]*tailfs.Share, error) {
+	result, err := lc.get200(ctx, "/localapi/v0/tailfs/shares")
+	if err != nil {
+		return nil, err
+	}
+	var shares []*tailfs.Share
+	err = json.Unmarshal(result, &shares)
+	return shares, err
 }
 
 // IPNBusWatcher is an active subscription (watch) of the local tailscaled IPN bus.

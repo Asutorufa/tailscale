@@ -6,6 +6,7 @@ package ipnlocal
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -23,6 +24,7 @@ import (
 	"go4.org/netipx"
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/appc"
+	"tailscale.com/appc/appctest"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store/mem"
@@ -684,12 +686,74 @@ func TestPeerAPIReplyToDNSQueries(t *testing.T) {
 	}
 }
 
+func TestPeerAPIPrettyReplyCNAME(t *testing.T) {
+	var h peerAPIHandler
+	h.remoteAddr = netip.MustParseAddrPort("100.150.151.152:12345")
+
+	eng, _ := wgengine.NewFakeUserspaceEngine(logger.Discard, 0)
+	pm := must.Get(newProfileManager(new(mem.Store), t.Logf))
+	h.ps = &peerAPIServer{
+		b: &LocalBackend{
+			e:     eng,
+			pm:    pm,
+			store: pm.Store(),
+			// configure as an app connector just to enable the API.
+			appConnector: appc.NewAppConnector(t.Logf, &appctest.RouteCollector{}),
+		},
+	}
+
+	h.ps.resolver = &fakeResolver{build: func(b *dnsmessage.Builder) {
+		b.CNAMEResource(
+			dnsmessage.ResourceHeader{
+				Name:  dnsmessage.MustNewName("www.example.com."),
+				Type:  dnsmessage.TypeCNAME,
+				Class: dnsmessage.ClassINET,
+				TTL:   0,
+			},
+			dnsmessage.CNAMEResource{
+				CNAME: dnsmessage.MustNewName("example.com."),
+			},
+		)
+		b.AResource(
+			dnsmessage.ResourceHeader{
+				Name:  dnsmessage.MustNewName("example.com."),
+				Type:  dnsmessage.TypeA,
+				Class: dnsmessage.ClassINET,
+				TTL:   0,
+			},
+			dnsmessage.AResource{
+				A: [4]byte{192, 0, 0, 8},
+			},
+		)
+	}}
+	f := filter.NewAllowAllForTest(logger.Discard)
+	h.ps.b.setFilter(f)
+
+	if !h.replyToDNSQueries() {
+		t.Errorf("unexpectedly deny; wanted to be a DNS server")
+	}
+
+	w := httptest.NewRecorder()
+	h.handleDNSQuery(w, httptest.NewRequest("GET", "/dns-query?q=www.example.com.", nil))
+	if w.Code != http.StatusOK {
+		t.Errorf("unexpected status code: %v", w.Code)
+	}
+	var addrs []string
+	json.NewDecoder(w.Body).Decode(&addrs)
+	if len(addrs) == 0 {
+		t.Fatalf("no addresses returned")
+	}
+	for _, addr := range addrs {
+		netip.MustParseAddr(addr)
+	}
+}
+
 func TestPeerAPIReplyToDNSQueriesAreObserved(t *testing.T) {
 	ctx := context.Background()
 	var h peerAPIHandler
 	h.remoteAddr = netip.MustParseAddrPort("100.150.151.152:12345")
 
-	rc := &routeCollector{}
+	rc := &appctest.RouteCollector{}
 	eng, _ := wgengine.NewFakeUserspaceEngine(logger.Discard, 0)
 	pm := must.Get(newProfileManager(new(mem.Store), t.Logf))
 	h.ps = &peerAPIServer{
@@ -703,7 +767,19 @@ func TestPeerAPIReplyToDNSQueriesAreObserved(t *testing.T) {
 	h.ps.b.appConnector.UpdateDomains([]string{"example.com"})
 	h.ps.b.appConnector.Wait(ctx)
 
-	h.ps.resolver = &fakeResolver{}
+	h.ps.resolver = &fakeResolver{build: func(b *dnsmessage.Builder) {
+		b.AResource(
+			dnsmessage.ResourceHeader{
+				Name:  dnsmessage.MustNewName("example.com."),
+				Type:  dnsmessage.TypeA,
+				Class: dnsmessage.ClassINET,
+				TTL:   0,
+			},
+			dnsmessage.AResource{
+				A: [4]byte{192, 0, 0, 8},
+			},
+		)
+	}}
 	f := filter.NewAllowAllForTest(logger.Discard)
 	h.ps.b.setFilter(f)
 
@@ -715,34 +791,92 @@ func TestPeerAPIReplyToDNSQueriesAreObserved(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
-	h.handleDNSQuery(w, httptest.NewRequest("GET", "/dns-query?q=true&t=example.com.", nil))
+	h.handleDNSQuery(w, httptest.NewRequest("GET", "/dns-query?q=example.com.", nil))
 	if w.Code != http.StatusOK {
 		t.Errorf("unexpected status code: %v", w.Code)
 	}
 	h.ps.b.appConnector.Wait(ctx)
 
 	wantRoutes := []netip.Prefix{netip.MustParsePrefix("192.0.0.8/32")}
-	if !slices.Equal(rc.routes, wantRoutes) {
-		t.Errorf("got %v; want %v", rc.routes, wantRoutes)
+	if !slices.Equal(rc.Routes(), wantRoutes) {
+		t.Errorf("got %v; want %v", rc.Routes(), wantRoutes)
 	}
 }
 
-type fakeResolver struct{}
+func TestPeerAPIReplyToDNSQueriesAreObservedWithCNAMEFlattening(t *testing.T) {
+	ctx := context.Background()
+	var h peerAPIHandler
+	h.remoteAddr = netip.MustParseAddrPort("100.150.151.152:12345")
+
+	rc := &appctest.RouteCollector{}
+	eng, _ := wgengine.NewFakeUserspaceEngine(logger.Discard, 0)
+	pm := must.Get(newProfileManager(new(mem.Store), t.Logf))
+	h.ps = &peerAPIServer{
+		b: &LocalBackend{
+			e:            eng,
+			pm:           pm,
+			store:        pm.Store(),
+			appConnector: appc.NewAppConnector(t.Logf, rc),
+		},
+	}
+	h.ps.b.appConnector.UpdateDomains([]string{"www.example.com"})
+	h.ps.b.appConnector.Wait(ctx)
+
+	h.ps.resolver = &fakeResolver{build: func(b *dnsmessage.Builder) {
+		b.CNAMEResource(
+			dnsmessage.ResourceHeader{
+				Name:  dnsmessage.MustNewName("www.example.com."),
+				Type:  dnsmessage.TypeCNAME,
+				Class: dnsmessage.ClassINET,
+				TTL:   0,
+			},
+			dnsmessage.CNAMEResource{
+				CNAME: dnsmessage.MustNewName("example.com."),
+			},
+		)
+		b.AResource(
+			dnsmessage.ResourceHeader{
+				Name:  dnsmessage.MustNewName("example.com."),
+				Type:  dnsmessage.TypeA,
+				Class: dnsmessage.ClassINET,
+				TTL:   0,
+			},
+			dnsmessage.AResource{
+				A: [4]byte{192, 0, 0, 8},
+			},
+		)
+	}}
+	f := filter.NewAllowAllForTest(logger.Discard)
+	h.ps.b.setFilter(f)
+
+	if !h.ps.b.OfferingAppConnector() {
+		t.Fatal("expecting to be offering app connector")
+	}
+	if !h.replyToDNSQueries() {
+		t.Errorf("unexpectedly deny; wanted to be a DNS server")
+	}
+
+	w := httptest.NewRecorder()
+	h.handleDNSQuery(w, httptest.NewRequest("GET", "/dns-query?q=www.example.com.", nil))
+	if w.Code != http.StatusOK {
+		t.Errorf("unexpected status code: %v", w.Code)
+	}
+	h.ps.b.appConnector.Wait(ctx)
+
+	wantRoutes := []netip.Prefix{netip.MustParsePrefix("192.0.0.8/32")}
+	if !slices.Equal(rc.Routes(), wantRoutes) {
+		t.Errorf("got %v; want %v", rc.Routes(), wantRoutes)
+	}
+}
+
+type fakeResolver struct {
+	build func(*dnsmessage.Builder)
+}
 
 func (f *fakeResolver) HandlePeerDNSQuery(ctx context.Context, q []byte, from netip.AddrPort, allowName func(name string) bool) (res []byte, err error) {
 	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{})
 	b.EnableCompression()
 	b.StartAnswers()
-	b.AResource(
-		dnsmessage.ResourceHeader{
-			Name:  dnsmessage.MustNewName("example.com."),
-			Type:  dnsmessage.TypeA,
-			Class: dnsmessage.ClassINET,
-			TTL:   0,
-		},
-		dnsmessage.AResource{
-			A: [4]byte{192, 0, 0, 8},
-		},
-	)
+	f.build(&b)
 	return b.Finish()
 }

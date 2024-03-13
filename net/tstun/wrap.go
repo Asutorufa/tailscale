@@ -160,8 +160,8 @@ type Wrapper struct {
 	// PreFilterPacketInboundFromWireGuard is the inbound filter function that runs before the main filter
 	// and therefore sees the packets that may be later dropped by it.
 	PreFilterPacketInboundFromWireGuard FilterFunc
-	// PostFilterPacketInboundFromWireGaurd is the inbound filter function that runs after the main filter.
-	PostFilterPacketInboundFromWireGaurd FilterFunc
+	// PostFilterPacketInboundFromWireGuard is the inbound filter function that runs after the main filter.
+	PostFilterPacketInboundFromWireGuard FilterFunc
 	// PreFilterPacketOutboundToWireGuardNetstackIntercept is a filter function that runs before the main filter
 	// for packets from the local system. This filter is populated by netstack to hook
 	// packets that should be handled by netstack. If set, this filter runs before
@@ -203,7 +203,7 @@ type Wrapper struct {
 type tunInjectedRead struct {
 	// Only one of packet or data should be set, and are read in that order of
 	// precedence.
-	packet stack.PacketBufferPtr
+	packet *stack.PacketBuffer
 	data   []byte
 }
 
@@ -1047,8 +1047,8 @@ func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook ca
 		return filter.Drop
 	}
 
-	if t.PostFilterPacketInboundFromWireGaurd != nil {
-		if res := t.PostFilterPacketInboundFromWireGaurd(p, t); res.IsDrop() {
+	if t.PostFilterPacketInboundFromWireGuard != nil {
+		if res := t.PostFilterPacketInboundFromWireGuard(p, t); res.IsDrop() {
 			return res
 		}
 	}
@@ -1113,7 +1113,7 @@ func (t *Wrapper) SetFilter(filt *filter.Filter) {
 //
 // This path is typically used to deliver synthesized packets to the
 // host networking stack.
-func (t *Wrapper) InjectInboundPacketBuffer(pkt stack.PacketBufferPtr) error {
+func (t *Wrapper) InjectInboundPacketBuffer(pkt *stack.PacketBuffer) error {
 	buf := make([]byte, PacketStartOffset+pkt.Size())
 
 	n := copy(buf[PacketStartOffset:], pkt.NetworkHeader().Slice())
@@ -1221,7 +1221,7 @@ func (t *Wrapper) InjectOutbound(pkt []byte) error {
 // InjectOutboundPacketBuffer logically behaves as InjectOutbound. It takes ownership of one
 // reference count on the packet, and the packet may be mutated. The packet refcount will be
 // decremented after the injected buffer has been read.
-func (t *Wrapper) InjectOutboundPacketBuffer(pkt stack.PacketBufferPtr) error {
+func (t *Wrapper) InjectOutboundPacketBuffer(pkt *stack.PacketBuffer) error {
 	size := pkt.Size()
 	if size > MaxPacketSize {
 		pkt.DecRef()

@@ -3,7 +3,7 @@
 
 import React, { useState } from "react"
 import { useAPI } from "src/api"
-import { ReactComponent as TailscaleIcon } from "src/assets/icons/tailscale-icon.svg"
+import TailscaleIcon from "src/assets/icons/tailscale-icon.svg?react"
 import { NodeData } from "src/types"
 import Button from "src/ui/button"
 import Collapsible from "src/ui/collapsible"
@@ -41,7 +41,7 @@ export default function LoginView({ data }: { data: NodeData }) {
         <>
           <div className="mb-6">
             <p className="text-gray-700">
-              Your device's key has expired. Reauthenticate this device by
+              Your device’s key has expired. Reauthenticate this device by
               logging in again, or{" "}
               <a
                 href="https://tailscale.com/kb/1028/key-expiry"

@@ -428,7 +428,7 @@ func (s *Server) TailscaleIPs() (ip4, ip6 netip.Addr) {
 		return
 	}
 	addrs := nm.GetAddresses()
-	for i := range addrs.LenIter() {
+	for i := range addrs.Len() {
 		addr := addrs.At(i)
 		ip := addr.Addr()
 		if ip.Is6() {
@@ -530,7 +530,8 @@ func (s *Server) start() (reterr error) {
 	closePool.add(s.dialer)
 	sys.Set(eng)
 
-	ns, err := netstack.Create(logf, sys.Tun.Get(), eng, sys.MagicSock.Get(), s.dialer, sys.DNSManager.Get(), sys.ProxyMapper())
+	// TODO(oxtoacart): do we need to support TailFS on tsnet, and if so, how?
+	ns, err := netstack.Create(logf, sys.Tun.Get(), eng, sys.MagicSock.Get(), s.dialer, sys.DNSManager.Get(), sys.ProxyMapper(), nil)
 	if err != nil {
 		return fmt.Errorf("netstack.Create: %w", err)
 	}

@@ -4,8 +4,8 @@
 import cx from "classnames"
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useAPI } from "src/api"
-import { ReactComponent as Check } from "src/assets/icons/check.svg"
-import { ReactComponent as ChevronDown } from "src/assets/icons/chevron-down.svg"
+import Check from "src/assets/icons/check.svg?react"
+import ChevronDown from "src/assets/icons/chevron-down.svg?react"
 import useExitNodes, {
   noExitNode,
   runAsExitNode,
@@ -180,7 +180,7 @@ export default function ExitNodeSelector({
       )}
       {pending && (
         <p className="text-white p-3">
-          Pending approval to run as exit node. This device won't be usable as
+          Pending approval to run as exit node. This device won’t be usable as
           an exit node until then.
         </p>
       )}

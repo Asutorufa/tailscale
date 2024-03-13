@@ -132,6 +132,17 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 			return fmt.Errorf("failed to add finalizer: %w", err)
 		}
 	}
+
+	proxyClass := proxyClassForObject(ing)
+	if proxyClass != "" {
+		if ready, err := proxyClassIsReady(ctx, proxyClass, a.Client); err != nil {
+			return fmt.Errorf("error verifying ProxyClass for Ingress: %w", err)
+		} else if !ready {
+			logger.Infof("ProxyClass %s specified for the Ingress, but is not (yet) Ready, waiting..", proxyClass)
+			return nil
+		}
+	}
+
 	a.mu.Lock()
 	a.managedIngresses.Add(ing.UID)
 	gaugeIngressResources.Set(int64(a.managedIngresses.Len()))
@@ -230,6 +241,12 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		}
 	}
 
+	if len(web.Handlers) == 0 {
+		logger.Warn("Ingress contains no valid backends")
+		a.recorder.Eventf(ing, corev1.EventTypeWarning, "NoValidBackends", "no valid backends")
+		return nil
+	}
+
 	crl := childResourceLabels(ing.Name, ing.Namespace, "ingress")
 	var tags []string
 	if tstr, ok := ing.Annotations[AnnotationTags]; ok {
@@ -247,6 +264,11 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		ServeConfig:         sc,
 		Tags:                tags,
 		ChildResourceLabels: crl,
+		ProxyClass:          proxyClass,
+	}
+
+	if val := ing.GetAnnotations()[AnnotationExperimentalForwardClusterTrafficViaL7IngresProxy]; val == "true" {
+		sts.ForwardClusterTrafficViaL7IngressProxy = true
 	}
 
 	if _, err := a.ssr.Provision(ctx, logger, sts); err != nil {

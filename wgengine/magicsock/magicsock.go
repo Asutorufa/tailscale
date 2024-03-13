@@ -60,6 +60,7 @@ import (
 	"tailscale.com/util/testenv"
 	"tailscale.com/util/uniq"
 	"tailscale.com/wgengine/capture"
+	"tailscale.com/wgengine/wgint"
 )
 
 const (
@@ -140,6 +141,8 @@ type Conn struct {
 	noV4, noV6 atomic.Bool
 
 	silentDiscoOn atomic.Bool // whether silent disco is enabled
+
+	probeUDPLifetimeOn atomic.Bool // whether probing of UDP lifetime is enabled
 
 	// noV4Send is whether IPv4 UDP is known to be unable to transmit
 	// at all. This could happen if the socket is in an invalid state
@@ -296,6 +299,10 @@ type Conn struct {
 	// onPortUpdate is called with the new port when magicsock rebinds to
 	// a new port.
 	onPortUpdate func(port uint16, network string)
+
+	// getPeerByKey optionally specifies a function to look up a peer's
+	// wireguard state by its public key. If nil, it's not used.
+	getPeerByKey func(key.NodePublic) (_ wgint.Peer, ok bool)
 }
 
 // SetDebugLoggingEnabled controls whether spammy debug logging is enabled.
@@ -365,6 +372,11 @@ type Options struct {
 	// OnPortUpdate is called with the new port when magicsock rebinds to
 	// a new port.
 	OnPortUpdate func(port uint16, network string)
+
+	// PeerByKeyFunc optionally specifies a function to look up a peer's
+	// WireGuard state by its public key. If nil, it's not used.
+	// In regular use, this will be wgengine.(*userspaceEngine).PeerByKey.
+	PeerByKeyFunc func(key.NodePublic) (_ wgint.Peer, ok bool)
 }
 
 func (o *Options) logf() logger.Logf {
@@ -438,6 +450,7 @@ func NewConn(opts Options) (*Conn, error) {
 	}
 	c.netMon = opts.NetMon
 	c.onPortUpdate = opts.OnPortUpdate
+	c.getPeerByKey = opts.PeerByKeyFunc
 
 	if err := c.rebind(keepCurrentPort); err != nil {
 		return nil, err
@@ -669,16 +682,7 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 	ni.OSHasIPv6.Set(report.OSHasIPv6)
 	ni.WorkingUDP.Set(report.UDP)
 	ni.WorkingICMPv4.Set(report.ICMPv4)
-	ni.PreferredDERP = report.PreferredDERP
-
-	if ni.PreferredDERP == 0 {
-		// Perhaps UDP is blocked. Pick a deterministic but arbitrary
-		// one.
-		ni.PreferredDERP = c.pickDERPFallback()
-	}
-	if !c.setNearestDERP(ni.PreferredDERP) {
-		ni.PreferredDERP = 0
-	}
+	ni.PreferredDERP = c.maybeSetNearestDERP(report)
 	ni.FirewallMode = hostinfo.FirewallMode()
 
 	c.callNetInfoCallback(ni)
@@ -749,7 +753,7 @@ func (c *Conn) LastRecvActivityOfNodeKey(nk key.NodePublic) string {
 	if !ok {
 		return "never"
 	}
-	saw := de.lastRecv.LoadAtomic()
+	saw := de.lastRecvWG.LoadAtomic()
 	if saw == 0 {
 		return "never"
 	}
@@ -1236,7 +1240,9 @@ func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *ippEndpointCache) 
 		cache.gen = de.numStopAndReset()
 		ep = de
 	}
-	ep.noteRecvActivity(ipp)
+	now := mono.Now()
+	ep.lastRecvUDPAny.StoreAtomic(now)
+	ep.noteRecvActivity(ipp, now)
 	if stats := c.stats.Load(); stats != nil {
 		stats.UpdateRxPhysical(ep.nodeAddr, ipp, len(b))
 	}
@@ -1317,7 +1323,7 @@ func (c *Conn) sendDiscoMessage(dst netip.AddrPort, dstKey key.NodePublic, dstDi
 	} else if err == nil {
 		// Can't send. (e.g. no IPv6 locally)
 	} else {
-		if !c.networkDown() {
+		if !c.networkDown() && pmtuShouldLogDiscoTxErr(m, err) {
 			c.logf("magicsock: disco: failed to send %v to %v: %v", disco.MessageSummary(m), dst, err)
 		}
 	}
@@ -1383,6 +1389,15 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netip.AddrPort, derpNodeSrc ke
 		return
 	}
 
+	isDERP := src.Addr() == tailcfg.DerpMagicIPAddr
+	if !isDERP {
+		// Record receive time for UDP transport packets.
+		pi, ok := c.peerMap.byIPPort[src]
+		if ok {
+			pi.ep.lastRecvUDPAny.StoreAtomic(mono.Now())
+		}
+	}
+
 	// We're now reasonably sure we're expecting communication from
 	// this peer, do the heavy crypto lifting to see what they want.
 	//
@@ -1430,7 +1445,6 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netip.AddrPort, derpNodeSrc ke
 		return
 	}
 
-	isDERP := src.Addr() == tailcfg.DerpMagicIPAddr
 	if isDERP {
 		metricRecvDiscoDERP.Add(1)
 	} else {
@@ -1781,7 +1795,7 @@ func nodesEqual(x, y views.Slice[tailcfg.NodeView]) bool {
 	if x.Len() != y.Len() {
 		return false
 	}
-	for i := range x.LenIter() {
+	for i := range x.Len() {
 		if !x.At(i).Equal(y.At(i)) {
 			return false
 		}
@@ -1817,11 +1831,13 @@ func debugRingBufferSize(numPeers int) int {
 // They might be set by envknob and/or controlknob.
 // The value is comparable.
 type debugFlags struct {
-	heartbeatDisabled bool
+	heartbeatDisabled  bool
+	probeUDPLifetimeOn bool
 }
 
 func (c *Conn) debugFlagsLocked() (f debugFlags) {
 	f.heartbeatDisabled = debugEnableSilentDisco() || c.silentDiscoOn.Load()
+	f.probeUDPLifetimeOn = c.probeUDPLifetimeOn.Load()
 	return
 }
 
@@ -1844,6 +1860,19 @@ func (c *Conn) SilentDisco() bool {
 	defer c.mu.Unlock()
 	flags := c.debugFlagsLocked()
 	return flags.heartbeatDisabled
+}
+
+// SetProbeUDPLifetime toggles probing of UDP lifetime based on v.
+func (c *Conn) SetProbeUDPLifetime(v bool) {
+	old := c.probeUDPLifetimeOn.Swap(v)
+	if old == v {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.peerMap.forEachEndpoint(func(ep *endpoint) {
+		ep.setProbeUDPLifetimeOn(v)
+	})
 }
 
 // SetNetworkMap is called when the control client gets a new network
@@ -1876,7 +1905,8 @@ func (c *Conn) SetNetworkMap(nm *netmap.NetworkMap) {
 	if nodesEqual(priorPeers, curPeers) && c.lastFlags == flags {
 		// The rest of this function is all adjusting state for peers that have
 		// changed. But if the set of peers is equal and the debug flags (for
-		// silent disco) haven't changed, no need to do anything else.
+		// silent disco and probe UDP lifetime) haven't changed, there is no
+		// need to do anything else.
 		return
 	}
 
@@ -1927,7 +1957,7 @@ func (c *Conn) SetNetworkMap(nm *netmap.NetworkMap) {
 			if epDisco := ep.disco.Load(); epDisco != nil {
 				oldDiscoKey = epDisco.key
 			}
-			ep.updateFromNode(n, flags.heartbeatDisabled)
+			ep.updateFromNode(n, flags.heartbeatDisabled, flags.probeUDPLifetimeOn)
 			c.peerMap.upsertEndpoint(ep, oldDiscoKey) // maybe update discokey mappings in peerMap
 			continue
 		}
@@ -1980,7 +2010,7 @@ func (c *Conn) SetNetworkMap(nm *netmap.NetworkMap) {
 			c.logEndpointCreated(n)
 		}
 
-		ep.updateFromNode(n, flags.heartbeatDisabled)
+		ep.updateFromNode(n, flags.heartbeatDisabled, flags.probeUDPLifetimeOn)
 		c.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
 	}
 
@@ -2028,7 +2058,7 @@ func (c *Conn) logEndpointCreated(n tailcfg.NodeView) {
 			fmt.Fprintf(w, "derp=%v%s ", regionID, code)
 		}
 
-		for i := range n.AllowedIPs().LenIter() {
+		for i := range n.AllowedIPs().Len() {
 			a := n.AllowedIPs().At(i)
 			if a.IsSingleIP() {
 				fmt.Fprintf(w, "aip=%v ", a.Addr())
@@ -2036,7 +2066,7 @@ func (c *Conn) logEndpointCreated(n tailcfg.NodeView) {
 				fmt.Fprintf(w, "aip=%v ", a)
 			}
 		}
-		for i := range n.Endpoints().LenIter() {
+		for i := range n.Endpoints().Len() {
 			ep := n.Endpoints().At(i)
 			fmt.Fprintf(w, "ep=%v ", ep)
 		}
@@ -2947,7 +2977,33 @@ var (
 	// received an peer MTU probe response for a given MTU size.
 	// TODO: add proper support for label maps in clientmetrics
 	metricRecvDiscoPeerMTUProbesByMTU syncs.Map[string, *clientmetric.Metric]
+
+	// metricUDPLifetime* metrics pertain to UDP lifetime probing, see type
+	// probeUDPLifetime. These metrics assume a static/default configuration for
+	// probing (defaultProbeUDPLifetimeConfig) until we disseminate
+	// ProbeUDPLifetimeConfig from control, and have lifetime management (GC old
+	// metrics) of clientmetrics or similar.
+	metricUDPLifetimeCliffsScheduled             = newUDPLifetimeCounter("magicsock_udp_lifetime_cliffs_scheduled")
+	metricUDPLifetimeCliffsCompleted             = newUDPLifetimeCounter("magicsock_udp_lifetime_cliffs_completed")
+	metricUDPLifetimeCliffsMissed                = newUDPLifetimeCounter("magicsock_udp_lifetime_cliffs_missed")
+	metricUDPLifetimeCliffsRescheduled           = newUDPLifetimeCounter("magicsock_udp_lifetime_cliffs_rescheduled")
+	metricUDPLifetimeCyclesCompleted             = newUDPLifetimeCounter("magicsock_udp_lifetime_cycles_completed")
+	metricUDPLifetimeCycleCompleteNoCliffReached = newUDPLifetimeCounter("magicsock_udp_lifetime_cycle_complete_no_cliff_reached")
+	metricUDPLifetimeCycleCompleteAt10sCliff     = newUDPLifetimeCounter("magicsock_udp_lifetime_cycle_complete_at_10s_cliff")
+	metricUDPLifetimeCycleCompleteAt30sCliff     = newUDPLifetimeCounter("magicsock_udp_lifetime_cycle_complete_at_30s_cliff")
+	metricUDPLifetimeCycleCompleteAt60sCliff     = newUDPLifetimeCounter("magicsock_udp_lifetime_cycle_complete_at_60s_cliff")
 )
+
+// newUDPLifetimeCounter returns a new *clientmetric.Metric with the provided
+// name combined with a suffix representing defaultProbeUDPLifetimeConfig.
+func newUDPLifetimeCounter(name string) *clientmetric.Metric {
+	var sb strings.Builder
+	for _, cliff := range defaultProbeUDPLifetimeConfig.Cliffs {
+		sb.WriteString(fmt.Sprintf("%ds", cliff/time.Second))
+	}
+	sb.WriteString(fmt.Sprintf("_%ds", defaultProbeUDPLifetimeConfig.CycleCanStartEvery/time.Second))
+	return clientmetric.NewCounter(fmt.Sprintf("%s_%s", name, sb.String()))
+}
 
 func getPeerMTUsProbedMetric(mtu tstun.WireMTU) *clientmetric.Metric {
 	key := fmt.Sprintf("magicsock_recv_disco_peer_mtu_probes_by_mtu_%d", mtu)

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -234,7 +235,12 @@ func (s *Server) newSessionID() (string, error) {
 	return "", errors.New("too many collisions generating new session; please refresh page")
 }
 
-type peerCapabilities map[capFeature]bool // value is true if the peer can edit the given feature
+// peerCapabilities holds information about what a source
+// peer is allowed to edit via the web UI.
+//
+// map value is true if the peer can edit the given feature.
+// Only capFeatures included in validCaps will be included.
+type peerCapabilities map[capFeature]bool
 
 // canEdit is true if the peerCapabilities grant edit access
 // to the given feature.
@@ -248,20 +254,46 @@ func (p peerCapabilities) canEdit(feature capFeature) bool {
 	return p[feature]
 }
 
+// isEmpty is true if p is either nil or has no capabilities
+// with value true.
+func (p peerCapabilities) isEmpty() bool {
+	if p == nil {
+		return true
+	}
+	for _, v := range p {
+		if v == true {
+			return false
+		}
+	}
+	return true
+}
+
 type capFeature string
 
 const (
 	// The following values should not be edited.
 	// New caps can be added, but existing ones should not be changed,
 	// as these exact values are used by users in tailnet policy files.
+	//
+	// IMPORTANT: When adding a new cap, also update validCaps slice below.
 
-	capFeatureAll      capFeature = "*"        // grants peer management of all features
-	capFeatureFunnel   capFeature = "funnel"   // grants peer serve/funnel management
-	capFeatureSSH      capFeature = "ssh"      // grants peer SSH server management
-	capFeatureSubnet   capFeature = "subnet"   // grants peer subnet routes management
-	capFeatureExitNode capFeature = "exitnode" // grants peer ability to advertise-as and use exit nodes
-	capFeatureAccount  capFeature = "account"  // grants peer ability to turn on auto updates and log out of node
+	capFeatureAll       capFeature = "*"         // grants peer management of all features
+	capFeatureSSH       capFeature = "ssh"       // grants peer SSH server management
+	capFeatureSubnets   capFeature = "subnets"   // grants peer subnet routes management
+	capFeatureExitNodes capFeature = "exitnodes" // grants peer ability to advertise-as and use exit nodes
+	capFeatureAccount   capFeature = "account"   // grants peer ability to turn on auto updates and log out of node
 )
+
+// validCaps contains the list of valid capabilities used in the web client.
+// Any capabilities included in a peer's grants that do not fall into this
+// list will be ignored.
+var validCaps []capFeature = []capFeature{
+	capFeatureAll,
+	capFeatureSSH,
+	capFeatureSubnets,
+	capFeatureExitNodes,
+	capFeatureAccount,
+}
 
 type capRule struct {
 	CanEdit []string `json:"canEdit,omitempty"` // list of features peer is allowed to edit
@@ -269,18 +301,38 @@ type capRule struct {
 
 // toPeerCapabilities parses out the web ui capabilities from the
 // given whois response.
-func toPeerCapabilities(whois *apitype.WhoIsResponse) (peerCapabilities, error) {
-	caps := peerCapabilities{}
-	if whois == nil {
-		return caps, nil
+func toPeerCapabilities(status *ipnstate.Status, whois *apitype.WhoIsResponse) (peerCapabilities, error) {
+	if whois == nil || status == nil {
+		return peerCapabilities{}, nil
 	}
+	if whois.Node.IsTagged() {
+		// We don't allow management *from* tagged nodes, so ignore caps.
+		// The web client auth flow relies on having a true user identity
+		// that can be verified through login.
+		return peerCapabilities{}, nil
+	}
+
+	if !status.Self.IsTagged() {
+		// User owned nodes are only ever manageable by the owner.
+		if status.Self.UserID != whois.UserProfile.ID {
+			return peerCapabilities{}, nil
+		} else {
+			return peerCapabilities{capFeatureAll: true}, nil // owner can edit all features
+		}
+	}
+
+	// For tagged nodes, we actually look at the granted capabilities.
+	caps := peerCapabilities{}
 	rules, err := tailcfg.UnmarshalCapJSON[capRule](whois.CapMap, tailcfg.PeerCapabilityWebUI)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal capability: %v", err)
 	}
 	for _, c := range rules {
 		for _, f := range c.CanEdit {
-			caps[capFeature(strings.ToLower(f))] = true
+			cap := capFeature(strings.ToLower(f))
+			if slices.Contains(validCaps, cap) {
+				caps[cap] = true
+			}
 		}
 	}
 	return caps, nil

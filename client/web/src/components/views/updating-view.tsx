@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 import React from "react"
-import { ReactComponent as CheckCircleIcon } from "src/assets/icons/check-circle.svg"
-import { ReactComponent as XCircleIcon } from "src/assets/icons/x-circle.svg"
+import CheckCircleIcon from "src/assets/icons/check-circle.svg?react"
+import XCircleIcon from "src/assets/icons/x-circle.svg?react"
 import { ChangelogText } from "src/components/update-available"
 import { UpdateState, useInstallUpdate } from "src/hooks/self-update"
 import { VersionInfo } from "src/types"
@@ -35,7 +35,7 @@ export function UpdatingView({
             <Spinner size="sm" className="text-gray-400" />
             <h1 className="text-2xl m-3">Update in progress</h1>
             <p className="text-gray-400">
-              The update shouldn't take more than a couple of minutes. Once it's
+              The update shouldn’t take more than a couple of minutes. Once it’s
               completed, you will be asked to log in again.
             </p>
           </>

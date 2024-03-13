@@ -43,7 +43,7 @@ main() {
 		#  - UBUNTU_CODENAME: if it exists, use instead of VERSION_CODENAME
 		. /etc/os-release
 		case "$ID" in
-			ubuntu|pop|neon|zorin)
+			ubuntu|pop|neon|zorin|tuxedo)
 				OS="ubuntu"
 				if [ "${UBUNTU_CODENAME:-}" != "" ]; then
 				    VERSION="$UBUNTU_CODENAME"
@@ -528,6 +528,7 @@ main() {
 			set -x
 			$SUDO apk add tailscale
 			$SUDO rc-update add tailscale
+			$SUDO rc-service tailscale start
 			set +x
 			;;
 		xbps)

@@ -6,8 +6,10 @@
 package linuxfw
 
 import (
+	"bytes"
 	"fmt"
 	"net/netip"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -59,6 +61,7 @@ func newIPTablesRunner(logf logger.Logf) (*iptablesRunner, error) {
 	supportsV6, supportsV6NAT := false, false
 	v6err := checkIPv6(logf)
 	ip6terr := checkIP6TablesExists()
+	var ipt6 *iptables.IPTables
 	switch {
 	case v6err != nil:
 		logf("disabling tunneled IPv6 due to system IPv6 config: %v", v6err)
@@ -66,18 +69,72 @@ func newIPTablesRunner(logf logger.Logf) (*iptablesRunner, error) {
 		logf("disabling tunneled IPv6 due to missing ip6tables: %v", ip6terr)
 	default:
 		supportsV6 = true
-		supportsV6NAT = supportsV6 && checkSupportsV6NAT()
-		logf("v6nat = %v", supportsV6NAT)
-	}
-
-	var ipt6 *iptables.IPTables
-	if supportsV6 {
 		ipt6, err = iptables.NewWithProtocol(iptables.ProtocolIPv6)
 		if err != nil {
 			return nil, err
 		}
+		supportsV6 = checkSupportsV6Filter(ipt6, logf)
+		if supportsV6 {
+			supportsV6NAT = checkSupportsV6NAT(ipt6, logf)
+		}
+		logf("v6filter = %v, v6nat = %v", supportsV6, supportsV6NAT)
 	}
 	return &iptablesRunner{ipt4, ipt6, supportsV6, supportsV6NAT}, nil
+}
+
+// checkSupportsV6Filter returns whether the system has a "filter" table in the
+// IPv6 tables. Some container environments such as GitHub codespaces have
+// limited local IPv6 support, and containers containing ip6tables, but do not
+// have kernel support for IPv6 filtering.
+// We will not enable IPv6 in these instances.
+func checkSupportsV6Filter(ipt *iptables.IPTables, logf logger.Logf) bool {
+	if ipt == nil {
+		return false
+	}
+	_, filterListErr := ipt.ListChains("filter")
+	if filterListErr == nil {
+		return true
+	}
+	logf("ipv6 unavailable due to missing filter table: %s", filterListErr)
+	return false
+}
+
+// checkSupportsV6NAT returns whether the system has a "nat" table in the
+// IPv6 netfilter stack.
+//
+// The nat table was added after the initial release of ipv6
+// netfilter, so some older distros ship a kernel that can't NAT IPv6
+// traffic.
+// ipt must be initialized for IPv6.
+func checkSupportsV6NAT(ipt *iptables.IPTables, logf logger.Logf) bool {
+	if ipt == nil || ipt.Proto() != iptables.ProtocolIPv6 {
+		return false
+	}
+	_, natListErr := ipt.ListChains("nat")
+	if natListErr == nil {
+		return true
+	}
+
+	// TODO (irbekrm): the following two checks were added before the check
+	// above that verifies that nat chains can be listed. It is a
+	// container-friendly check (see
+	// https://github.com/tailscale/tailscale/issues/11344), but also should
+	// be good enough on its own in other environments. If we never observe
+	// it falsely succeed, let's remove the other two checks.
+
+	bs, err := os.ReadFile("/proc/net/ip6_tables_names")
+	if err != nil {
+		return false
+	}
+	if bytes.Contains(bs, []byte("nat\n")) {
+		logf("[unexpected] listing nat chains failed, but /proc/net/ip6_tables_name reports a nat table existing")
+		return true
+	}
+	if exec.Command("modprobe", "ip6table_nat").Run() == nil {
+		logf("[unexpected] listing nat chains failed, but modprobe ip6table_nat succeeded")
+		return true
+	}
+	return false
 }
 
 // HasIPV6 reports true if the system supports IPv6.

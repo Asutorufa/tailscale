@@ -7,6 +7,7 @@ package tsweb
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"expvar"
@@ -15,8 +16,10 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,10 +27,10 @@ import (
 
 	"go4.org/mem"
 	"tailscale.com/envknob"
+	"tailscale.com/metrics"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tsweb/varz"
 	"tailscale.com/types/logger"
-	"tailscale.com/util/cmpx"
 	"tailscale.com/util/vizerror"
 )
 
@@ -153,7 +156,7 @@ func (h Port80Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Redirect authorized user to the debug handler.
 		path = "/debug/"
 	}
-	host := cmpx.Or(h.FQDN, r.Host)
+	host := cmp.Or(h.FQDN, r.Host)
 	target := "https://" + host + path
 	http.Redirect(w, r, target, http.StatusFound)
 }
@@ -174,6 +177,60 @@ type ReturnHandler interface {
 	ServeHTTPReturn(http.ResponseWriter, *http.Request) error
 }
 
+// BucketedStatsOptions describes tsweb handler options surrounding
+// the generation of metrics, grouped into buckets.
+type BucketedStatsOptions struct {
+	// Bucket returns which bucket the given request is in.
+	// If nil, [NormalizedPath] is used to compute the bucket.
+	Bucket func(req *http.Request) string
+
+	// If non-nil, Started maintains a counter of all requests which
+	// have begun processing.
+	Started *metrics.LabelMap
+
+	// If non-nil, Finished maintains a counter of all requests which
+	// have finished processing (that is, the HTTP handler has returned).
+	Finished *metrics.LabelMap
+}
+
+// normalizePathRegex matches components in a HTTP request path
+// that should be replaced.
+//
+// See: https://regex101.com/r/WIfpaR/3 for the explainer and test cases.
+var normalizePathRegex = regexp.MustCompile("([a-fA-F0-9]{9,}|([^\\/])+\\.([^\\/]){2,}|((n|k|u|L|t|S)[a-zA-Z0-9]{5,}(CNTRL|Djz1H|LV5CY|mxgaY|jNy1b))|(([^\\/])+\\@passkey))")
+
+// NormalizedPath returns the given path with the following modifications:
+//
+//   - any query parameters are removed
+//   - any path component with a hex string of 9 or more characters is
+//     replaced by an ellipsis
+//   - any path component containing a period with at least two characters
+//     after the period (i.e. an email or domain)
+//   - any path component consisting of a common Tailscale Stable ID
+//   - any path segment *@passkey.
+func NormalizedPath(p string) string {
+	// Fastpath: No hex sequences in there we might have to trim.
+	// Avoids allocating.
+	if normalizePathRegex.FindStringIndex(p) == nil {
+		b, _, _ := strings.Cut(p, "?")
+		return b
+	}
+
+	// If we got here, there's at least one hex sequences we need to
+	// replace with an ellipsis.
+	replaced := normalizePathRegex.ReplaceAllString(p, "…")
+	b, _, _ := strings.Cut(replaced, "?")
+	return b
+}
+
+func (o *BucketedStatsOptions) bucketForRequest(r *http.Request) string {
+	if o.Bucket != nil {
+		return o.Bucket(r)
+	}
+
+	return NormalizedPath(r.URL.Path)
+}
+
 type HandlerOptions struct {
 	QuietLoggingIfSuccessful bool // if set, do not log successfully handled HTTP requests (200 and 304 status codes)
 	Logf                     logger.Logf
@@ -187,6 +244,10 @@ type HandlerOptions struct {
 	// codes for handled responses.
 	// The keys are HTTP numeric response codes e.g. 200, 404, ...
 	StatusCodeCountersFull *expvar.Map
+
+	// If non-nil, BucketedStats computes and exposes statistics
+	// for each bucket based on the contained parameters.
+	BucketedStats *BucketedStatsOptions
 
 	// OnError is called if the handler returned a HTTPError. This
 	// is intended to be used to present pretty error pages if
@@ -247,6 +308,14 @@ func (h retHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		UserAgent:  r.UserAgent(),
 		Referer:    r.Referer(),
 		RequestID:  RequestIDFromContext(r.Context()),
+	}
+
+	var bucket string
+	if bs := h.opts.BucketedStats; bs != nil {
+		bucket = bs.bucketForRequest(r)
+		if bs.Started != nil {
+			bs.Started.Add(bucket, 1)
+		}
 	}
 
 	lw := &loggingResponseWriter{ResponseWriter: w, logf: h.opts.Logf}
@@ -329,6 +398,10 @@ func (h retHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			msg.Code = http.StatusInternalServerError
 			http.Error(lw, errorMessage, msg.Code)
 		}
+	}
+
+	if bs := h.opts.BucketedStats; bs != nil && bs.Finished != nil {
+		bs.Finished.Add(bucket, 1)
 	}
 
 	if !h.opts.QuietLoggingIfSuccessful || (msg.Code != http.StatusOK && msg.Code != http.StatusNotModified) {
@@ -445,6 +518,77 @@ func Error(code int, msg string, err error) HTTPError {
 // TODO: migrate all users to varz.Handler or promvarz.Handler and remove this.
 func VarzHandler(w http.ResponseWriter, r *http.Request) {
 	varz.Handler(w, r)
+}
+
+// CleanRedirectURL ensures that urlStr is a valid redirect URL to the
+// current server, or one of allowedHosts. Returns the cleaned URL or
+// a validation error.
+func CleanRedirectURL(urlStr string, allowedHosts []string) (*url.URL, error) {
+	if urlStr == "" {
+		return &url.URL{}, nil
+	}
+	// In some places, we unfortunately query-escape the redirect URL
+	// too many times, and end up needing to redirect to a URL that's
+	// still escaped by one level. Try to unescape the input.
+	unescaped, err := url.QueryUnescape(urlStr)
+	if err == nil && unescaped != urlStr {
+		urlStr = unescaped
+	}
+
+	// Go's URL parser and browser URL parsers disagree on the meaning
+	// of malformed HTTP URLs. Given the input https:/evil.com, Go
+	// parses it as hostname="", path="/evil.com". Browsers parse it
+	// as hostname="evil.com", path="". This means that, using
+	// malformed URLs, an attacker could trick us into approving of a
+	// "local" redirect that in fact sends people elsewhere.
+	//
+	// This very blunt check enforces that we'll only process
+	// redirects that are definitely well-formed URLs.
+	//
+	// Note that the check for just / also allows URLs of the form
+	// "//foo.com/bar", which are scheme-relative redirects. These
+	// must be handled with care below when determining whether a
+	// redirect is relative to the current host. Notably,
+	// url.URL.IsAbs reports // URLs as relative, whereas we want to
+	// treat them as absolute redirects and verify the target host.
+	if !hasSafeRedirectPrefix(urlStr) {
+		return nil, fmt.Errorf("invalid redirect URL %q", urlStr)
+	}
+
+	url, err := url.Parse(urlStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid redirect URL %q: %w", urlStr, err)
+	}
+	// Redirects to self are always allowed. A self redirect must
+	// start with url.Path, all prior URL sections must be empty.
+	isSelfRedirect := url.Scheme == "" && url.Opaque == "" && url.User == nil && url.Host == ""
+	if isSelfRedirect {
+		return url, nil
+	}
+	for _, allowed := range allowedHosts {
+		if strings.EqualFold(allowed, url.Hostname()) {
+			return url, nil
+		}
+	}
+
+	return nil, fmt.Errorf("disallowed target host %q in redirect URL %q", url.Hostname(), urlStr)
+}
+
+// hasSafeRedirectPrefix reports whether url starts with a slash, or
+// one of the case-insensitive strings "http://" or "https://".
+func hasSafeRedirectPrefix(url string) bool {
+	if len(url) >= 1 && url[0] == '/' {
+		return true
+	}
+	const http = "http://"
+	if len(url) >= len(http) && strings.EqualFold(url[:len(http)], http) {
+		return true
+	}
+	const https = "https://"
+	if len(url) >= len(https) && strings.EqualFold(url[:len(https)], https) {
+		return true
+	}
+	return false
 }
 
 // AddBrowserHeaders sets various HTTP security headers for browser-facing endpoints.

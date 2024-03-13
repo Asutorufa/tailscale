@@ -18,7 +18,9 @@ import (
 	"net/http/httputil"
 	"net/netip"
 	"net/url"
+	"os"
 	"os/exec"
+	"path"
 	"runtime"
 	"slices"
 	"strconv"
@@ -41,6 +43,7 @@ import (
 	"tailscale.com/net/portmapper"
 	"tailscale.com/tailcfg"
 	"tailscale.com/taildrop"
+	"tailscale.com/tailfs"
 	"tailscale.com/tka"
 	"tailscale.com/tstime"
 	"tailscale.com/types/key"
@@ -107,6 +110,9 @@ var handler = map[string]localAPIHandler{
 	"serve-config":                (*Handler).serveServeConfig,
 	"set-dns":                     (*Handler).serveSetDNS,
 	"set-expiry-sooner":           (*Handler).serveSetExpirySooner,
+	"set-gui-visible":             (*Handler).serveSetGUIVisible,
+	"tailfs/fileserver-address":   (*Handler).serveTailFSFileServerAddr,
+	"tailfs/shares":               (*Handler).serveShares,
 	"start":                       (*Handler).serveStart,
 	"status":                      (*Handler).serveStatus,
 	"tka/init":                    (*Handler).serveTKAInit,
@@ -593,6 +599,8 @@ func (h *Handler) serveDebug(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		h.b.DebugNotify(n)
+	case "notify-last-netmap":
+		h.b.DebugNotifyLastNetMap()
 	case "break-tcp-conns":
 		err = h.b.DebugBreakTCPConns()
 	case "break-derp-conns":
@@ -1107,7 +1115,7 @@ func (h *Handler) connIsLocalAdmin() bool {
 		if err != nil {
 			return false
 		}
-		// Short timeout just in case sudo hands for some reason.
+		// Short timeout just in case sudo hangs for some reason.
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		if err := exec.CommandContext(ctx, "sudo", "--other-user="+u.Name, "--list", "tailscale").Run(); err != nil {
@@ -1117,6 +1125,34 @@ func (h *Handler) connIsLocalAdmin() bool {
 
 	default:
 		return false
+	}
+}
+
+func (h *Handler) getUsername() (string, error) {
+	if h.ConnIdentity == nil {
+		h.logf("[unexpected] missing ConnIdentity in LocalAPI Handler")
+		return "", errors.New("missing ConnIdentity")
+	}
+	switch runtime.GOOS {
+	case "windows":
+		tok, err := h.ConnIdentity.WindowsToken()
+		if err != nil {
+			return "", fmt.Errorf("get windows token: %w", err)
+		}
+		defer tok.Close()
+		return tok.Username()
+	case "darwin", "linux":
+		uid, ok := h.ConnIdentity.Creds().UserID()
+		if !ok {
+			return "", errors.New("missing user ID")
+		}
+		u, err := osuser.LookupByUID(uid)
+		if err != nil {
+			return "", fmt.Errorf("lookup user: %w", err)
+		}
+		return u.Username, nil
+	default:
+		return "", errors.New("unsupported OS")
 	}
 }
 
@@ -1871,6 +1907,27 @@ func (h *Handler) serveTKAStatus(w http.ResponseWriter, r *http.Request) {
 	w.Write(j)
 }
 
+func (h *Handler) serveSetGUIVisible(w http.ResponseWriter, r *http.Request) {
+	if r.Method != httpm.POST {
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+
+	type setGUIVisibleRequest struct {
+		IsVisible bool   // whether the Tailscale client UI is now presented to the user
+		SessionID string // the last SessionID sent to the client in ipn.Notify.SessionID
+	}
+	var req setGUIVisibleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	// TODO(bradfitz): use `req.IsVisible == true` to flush netmap
+
+	w.WriteHeader(http.StatusOK)
+}
+
 func (h *Handler) serveTKASign(w http.ResponseWriter, r *http.Request) {
 	if !h.PermitWrite {
 		http.Error(w, "lock sign access denied", http.StatusForbidden)
@@ -1991,7 +2048,7 @@ func (h *Handler) serveTKAWrapPreauthKey(w http.ResponseWriter, r *http.Request)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	w.WriteHeader(200)
+	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(wrappedKey))
 }
 
@@ -2045,7 +2102,7 @@ func (h *Handler) serveTKADisable(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "network-lock disable failed: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	w.WriteHeader(200)
+	w.WriteHeader(http.StatusOK)
 }
 
 func (h *Handler) serveTKALocalDisable(w http.ResponseWriter, r *http.Request) {
@@ -2069,7 +2126,7 @@ func (h *Handler) serveTKALocalDisable(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "network-lock local disable failed: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	w.WriteHeader(200)
+	w.WriteHeader(http.StatusOK)
 }
 
 func (h *Handler) serveTKALog(w http.ResponseWriter, r *http.Request) {
@@ -2391,7 +2448,7 @@ func (h *Handler) serveDebugCapture(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.WriteHeader(200)
+	w.WriteHeader(http.StatusOK)
 	w.(http.Flusher).Flush()
 	h.b.StreamDebugCapture(r.Context(), w)
 }
@@ -2496,6 +2553,124 @@ func (h *Handler) serveUpdateProgress(w http.ResponseWriter, r *http.Request) {
 	ups := h.b.GetSelfUpdateProgress()
 
 	json.NewEncoder(w).Encode(ups)
+}
+
+// serveTailFSFileServerAddr handles updates of the tailfs file server address.
+func (h *Handler) serveTailFSFileServerAddr(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "PUT" {
+		http.Error(w, "only PUT allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	b, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	h.b.TailFSSetFileServerAddr(string(b))
+	w.WriteHeader(http.StatusCreated)
+}
+
+// serveShares handles the management of tailfs shares.
+//
+// PUT - adds or updates an existing share
+// DELETE - removes a share
+// GET - gets a list of all shares, sorted by name
+// POST - renames an existing share
+func (h *Handler) serveShares(w http.ResponseWriter, r *http.Request) {
+	if !h.b.TailFSSharingEnabled() {
+		http.Error(w, `tailfs sharing not enabled, please add the attribute "tailfs:share" to this node in your ACLs' "nodeAttrs" section`, http.StatusForbidden)
+		return
+	}
+	switch r.Method {
+	case "PUT":
+		var share tailfs.Share
+		err := json.NewDecoder(r.Body).Decode(&share)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		share.Path = path.Clean(share.Path)
+		fi, err := os.Stat(share.Path)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if !fi.IsDir() {
+			http.Error(w, "not a directory", http.StatusBadRequest)
+			return
+		}
+		if tailfs.AllowShareAs() {
+			// share as the connected user
+			username, err := h.getUsername()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			share.As = username
+		}
+		err = h.b.TailFSSetShare(&share)
+		if err != nil {
+			if errors.Is(err, ipnlocal.ErrInvalidShareName) {
+				http.Error(w, "invalid share name", http.StatusBadRequest)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+	case "DELETE":
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		err = h.b.TailFSRemoveShare(string(b))
+		if err != nil {
+			if os.IsNotExist(err) {
+				http.Error(w, "share not found", http.StatusNotFound)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	case "POST":
+		var names [2]string
+		err := json.NewDecoder(r.Body).Decode(&names)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		err = h.b.TailFSRenameShare(names[0], names[1])
+		if err != nil {
+			if os.IsNotExist(err) {
+				http.Error(w, "share not found", http.StatusNotFound)
+				return
+			}
+			if os.IsExist(err) {
+				http.Error(w, "share name already used", http.StatusBadRequest)
+				return
+			}
+			if errors.Is(err, ipnlocal.ErrInvalidShareName) {
+				http.Error(w, "invalid share name", http.StatusBadRequest)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	case "GET":
+		shares := h.b.TailFSGetShares()
+		err := json.NewEncoder(w).Encode(shares)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	default:
+		http.Error(w, "unsupported method", http.StatusMethodNotAllowed)
+	}
 }
 
 var (

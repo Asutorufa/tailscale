@@ -38,10 +38,15 @@ import (
 	"tailscale.com/net/sockstats"
 	"tailscale.com/tailcfg"
 	"tailscale.com/taildrop"
+	"tailscale.com/tailfs"
 	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/httphdr"
 	"tailscale.com/wgengine/filter"
+)
+
+const (
+	tailFSPrefix = "/v0/tailfs"
 )
 
 var initListenConfig func(*net.ListenConfig, netip.Addr, *interfaces.State, string) error
@@ -317,6 +322,10 @@ func (h *peerAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleDNSQuery(w, r)
 		return
 	}
+	if strings.HasPrefix(r.URL.Path, tailFSPrefix) {
+		h.handleServeTailFS(w, r)
+		return
+	}
 	switch r.URL.Path {
 	case "/v0/goroutines":
 		h.handleServeGoroutines(w, r)
@@ -342,6 +351,7 @@ func (h *peerAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case "/v0/doctor":
 		h.handleServeDoctor(w, r)
+		return
 	case "/v0/sockstats":
 		h.handleServeSockStats(w, r)
 		return
@@ -626,7 +636,11 @@ func (h *peerAPIHandler) canIngress() bool {
 }
 
 func (h *peerAPIHandler) peerHasCap(wantCap tailcfg.PeerCapability) bool {
-	return h.ps.b.PeerCaps(h.remoteAddr.Addr()).HasCapability(wantCap)
+	return h.peerCaps().HasCapability(wantCap)
+}
+
+func (h *peerAPIHandler) peerCaps() tailcfg.PeerCapMap {
+	return h.ps.b.PeerCaps(h.remoteAddr.Addr())
 }
 
 func (h *peerAPIHandler) handlePeerPut(w http.ResponseWriter, r *http.Request) {
@@ -1054,6 +1068,9 @@ func writePrettyDNSReply(w io.Writer, res []byte) (err error) {
 			return err
 		}
 		if h.Class != dnsmessage.ClassINET {
+			if err := p.SkipAnswer(); err != nil {
+				return err
+			}
 			continue
 		}
 		switch h.Type {
@@ -1075,12 +1092,49 @@ func writePrettyDNSReply(w io.Writer, res []byte) (err error) {
 				return err
 			}
 			gotIPs = append(gotIPs, r.TXT...)
+		default:
+			if err := p.SkipAnswer(); err != nil {
+				return err
+			}
 		}
 	}
 	j, _ := json.Marshal(gotIPs)
 	j = append(j, '\n')
 	w.Write(j)
 	return nil
+}
+
+func (h *peerAPIHandler) handleServeTailFS(w http.ResponseWriter, r *http.Request) {
+	if !h.ps.b.TailFSSharingEnabled() {
+		http.Error(w, "tailfs not enabled", http.StatusNotFound)
+		return
+	}
+
+	capsMap := h.peerCaps()
+	tailfsCaps, ok := capsMap[tailcfg.PeerCapabilityTailFS]
+	if !ok {
+		http.Error(w, "tailfs not permitted", http.StatusForbidden)
+		return
+	}
+
+	rawPerms := make([][]byte, 0, len(tailfsCaps))
+	for _, cap := range tailfsCaps {
+		rawPerms = append(rawPerms, []byte(cap))
+	}
+
+	p, err := tailfs.ParsePermissions(rawPerms)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	fs, ok := h.ps.b.sys.TailFSForRemote.GetOK()
+	if !ok {
+		http.Error(w, "tailfs not enabled", http.StatusNotFound)
+		return
+	}
+	r.URL.Path = strings.TrimPrefix(r.URL.Path, tailFSPrefix)
+	fs.ServeHTTPWithPerms(p, w, r)
 }
 
 // newFakePeerAPIListener creates a new net.Listener that acts like

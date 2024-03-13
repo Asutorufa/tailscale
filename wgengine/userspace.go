@@ -13,6 +13,7 @@ import (
 	"math"
 	"net/netip"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +35,7 @@ import (
 	"tailscale.com/net/tstun"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailfs"
 	"tailscale.com/tstime/mono"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/ipproto"
@@ -201,6 +203,10 @@ type Config struct {
 
 	// SetSubsystem, if non-nil, is called for each new subsystem created, just before a successful return.
 	SetSubsystem func(any)
+
+	// TailFSForLocal, if populated, will cause the engine to expose a TailFS
+	// listener at 100.100.100.100:8080.
+	TailFSForLocal tailfs.FileSystemForLocal
 }
 
 // NewFakeUserspaceEngine returns a new userspace engine for testing.
@@ -341,6 +347,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		NetMon:           e.netMon,
 		ControlKnobs:     conf.ControlKnobs,
 		OnPortUpdate:     onPortUpdate,
+		PeerByKeyFunc:    e.PeerByKey,
 	}
 
 	var err error
@@ -354,7 +361,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 	tsTUNDev.SetDiscoKey(e.magicConn.DiscoPublicKey())
 
 	if conf.RespondToPing {
-		e.tundev.PostFilterPacketInboundFromWireGaurd = echoRespondToAll
+		e.tundev.PostFilterPacketInboundFromWireGuard = echoRespondToAll
 	}
 	e.tundev.PreFilterPacketOutboundToWireGuardEngineIntercept = e.handleLocalPackets
 
@@ -420,6 +427,21 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		}
 	}()
 
+	go func() {
+		select {
+		case <-e.wgdev.Wait():
+			e.mu.Lock()
+			closing := e.closing
+			e.mu.Unlock()
+			if !closing {
+				e.logf("Closing the engine because the WireGuard device has been closed...")
+				e.Close()
+			}
+		case <-e.waitCh:
+			// continue
+		}
+	}()
+
 	e.logf("Bringing WireGuard device up...")
 	if err := e.wgdev.Up(); err != nil {
 		return nil, fmt.Errorf("wgdev.Up: %w", err)
@@ -446,6 +468,9 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		conf.SetSubsystem(conf.Router)
 		conf.SetSubsystem(conf.Dialer)
 		conf.SetSubsystem(e.netMon)
+		if conf.TailFSForLocal != nil {
+			conf.SetSubsystem(conf.TailFSForLocal)
+		}
 	}
 
 	e.logf("Engine created.")
@@ -772,7 +797,7 @@ func (e *userspaceEngine) updateActivityMapsLocked(trackNodes []key.NodePublic, 
 // hasOverlap checks if there is a IPPrefix which is common amongst the two
 // provided slices.
 func hasOverlap(aips, rips views.Slice[netip.Prefix]) bool {
-	for i := range aips.LenIter() {
+	for i := range aips.Len() {
 		aip := aips.At(i)
 		if views.SliceContains(rips, aip) {
 			return true
@@ -987,21 +1012,30 @@ func (e *userspaceEngine) getStatusCallback() StatusCallback {
 
 var ErrEngineClosing = errors.New("engine closing; no status")
 
-func (e *userspaceEngine) getPeerStatusLite(pk key.NodePublic) (status ipnstate.PeerStatusLite, ok bool) {
+func (e *userspaceEngine) PeerByKey(pubKey key.NodePublic) (_ wgint.Peer, ok bool) {
 	e.wgLock.Lock()
-	if e.wgdev == nil {
-		e.wgLock.Unlock()
-		return status, false
-	}
-	peer := e.wgdev.LookupPeer(pk.Raw32())
+	dev := e.wgdev
 	e.wgLock.Unlock()
+
+	if dev == nil {
+		return wgint.Peer{}, false
+	}
+	peer := dev.LookupPeer(pubKey.Raw32())
 	if peer == nil {
+		return wgint.Peer{}, false
+	}
+	return wgint.PeerOf(peer), true
+}
+
+func (e *userspaceEngine) getPeerStatusLite(pk key.NodePublic) (status ipnstate.PeerStatusLite, ok bool) {
+	peer, ok := e.PeerByKey(pk)
+	if !ok {
 		return status, false
 	}
 	status.NodeKey = pk
-	status.RxBytes = int64(wgint.PeerRxBytes(peer))
-	status.TxBytes = int64(wgint.PeerTxBytes(peer))
-	status.LastHandshake = time.Unix(0, wgint.PeerLastHandshakeNano(peer))
+	status.RxBytes = int64(peer.RxBytes())
+	status.TxBytes = int64(peer.TxBytes())
+	status.LastHandshake = peer.LastHandshake()
 	return status, true
 }
 
@@ -1013,9 +1047,8 @@ func (e *userspaceEngine) getStatus() (*Status, error) {
 
 	e.mu.Lock()
 	closing := e.closing
-	peerKeys := make([]key.NodePublic, len(e.peerSequence))
-	copy(peerKeys, e.peerSequence)
-	localAddrs := append([]tailcfg.Endpoint(nil), e.endpoints...)
+	peerKeys := slices.Clone(e.peerSequence)
+	localAddrs := slices.Clone(e.endpoints)
 	e.mu.Unlock()
 
 	if closing {
@@ -1024,7 +1057,7 @@ func (e *userspaceEngine) getStatus() (*Status, error) {
 
 	peers := make([]ipnstate.PeerStatusLite, 0, len(peerKeys))
 	for _, key := range peerKeys {
-		if status, found := e.getPeerStatusLite(key); found {
+		if status, ok := e.getPeerStatusLite(key); ok {
 			peers = append(peers, status)
 		}
 	}
@@ -1104,8 +1137,8 @@ func (e *userspaceEngine) Close() {
 	}
 }
 
-func (e *userspaceEngine) Wait() {
-	<-e.waitCh
+func (e *userspaceEngine) Done() <-chan struct{} {
+	return e.waitCh
 }
 
 func (e *userspaceEngine) linkChange(delta *netmon.ChangeDelta) {
@@ -1225,7 +1258,7 @@ func (e *userspaceEngine) mySelfIPMatchingFamily(dst netip.Addr) (src netip.Addr
 	if addrs.Len() == 0 {
 		return zero, errors.New("no self address in netmap")
 	}
-	for i := range addrs.LenIter() {
+	for i := range addrs.Len() {
 		if a := addrs.At(i); a.IsSingleIP() && a.Addr().BitLen() == dst.BitLen() {
 			return a.Addr(), nil
 		}
@@ -1371,7 +1404,7 @@ func (e *userspaceEngine) PeerForIP(ip netip.Addr) (ret PeerForIP, ok bool) {
 	// Check for exact matches before looking for subnet matches.
 	// TODO(bradfitz): add maps for these. on NetworkMap?
 	for _, p := range nm.Peers {
-		for i := range p.Addresses().LenIter() {
+		for i := range p.Addresses().Len() {
 			a := p.Addresses().At(i)
 			if a.Addr() == ip && a.IsSingleIP() && tsaddr.IsTailscaleIP(ip) {
 				return PeerForIP{Node: p, Route: a}, true
@@ -1379,7 +1412,7 @@ func (e *userspaceEngine) PeerForIP(ip netip.Addr) (ret PeerForIP, ok bool) {
 		}
 	}
 	addrs := nm.GetAddresses()
-	for i := range addrs.LenIter() {
+	for i := range addrs.Len() {
 		if a := addrs.At(i); a.Addr() == ip && a.IsSingleIP() && tsaddr.IsTailscaleIP(ip) {
 			return PeerForIP{Node: nm.SelfNode, IsSelf: true, Route: a}, true
 		}

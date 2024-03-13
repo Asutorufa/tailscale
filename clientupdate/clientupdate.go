@@ -167,6 +167,10 @@ func (up *Updater) getUpdateFunction() (fn updateFunction, canAutoUpdate bool) {
 		return up.updateWindows, true
 	case "linux":
 		switch distro.Get() {
+		case distro.NixOS:
+			// NixOS packages are immutable and managed with a system-wide
+			// configuration.
+			return up.updateNixos, false
 		case distro.Synology:
 			// Synology updates use our own pkgs.tailscale.com instead of the
 			// Synology Package Center. We should eventually get to a regular
@@ -522,6 +526,13 @@ func (up *Updater) updateArchLike() error {
 you can use "pacman --sync --refresh --sysupgrade" or "pacman -Syu" to upgrade the system, including Tailscale.`)
 }
 
+func (up *Updater) updateNixos() error {
+	// NixOS package updates are managed on a system level and not individually.
+	// Direct users to update their nix channel or nixpkgs flake input to
+	// receive the latest version.
+	return errors.New(`individual package updates are not supported on NixOS installations. Update your system channel or flake inputs to get the latest Tailscale version from nixpkgs.`)
+}
+
 const yumRepoConfigFile = "/etc/yum.repos.d/tailscale.repo"
 
 // updateFedoraLike updates tailscale on any distros in the Fedora family,
@@ -654,6 +665,7 @@ func (up *Updater) updateAlpineLike() (err error) {
 
 func parseAlpinePackageVersion(out []byte) (string, error) {
 	s := bufio.NewScanner(bytes.NewReader(out))
+	var maxVer string
 	for s.Scan() {
 		// The line should look like this:
 		// tailscale-1.44.2-r0 description:
@@ -665,7 +677,13 @@ func parseAlpinePackageVersion(out []byte) (string, error) {
 		if len(parts) < 3 {
 			return "", fmt.Errorf("malformed info line: %q", line)
 		}
-		return parts[1], nil
+		ver := parts[1]
+		if cmpver.Compare(ver, maxVer) == 1 {
+			maxVer = ver
+		}
+	}
+	if maxVer != "" {
+		return maxVer, nil
 	}
 	return "", errors.New("tailscale version not found in output")
 }

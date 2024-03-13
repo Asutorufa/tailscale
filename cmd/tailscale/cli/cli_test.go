@@ -5,6 +5,7 @@ package cli
 
 import (
 	"bytes"
+	stdcmp "cmp"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -24,7 +25,6 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/preftype"
-	"tailscale.com/util/cmpx"
 	"tailscale.com/version/distro"
 )
 
@@ -758,7 +758,7 @@ func TestPrefsFromUpArgs(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var warnBuf tstest.MemLogger
-			goos := cmpx.Or(tt.goos, "linux")
+			goos := stdcmp.Or(tt.goos, "linux")
 			st := tt.st
 			if st == nil {
 				st = new(ipnstate.Status)
@@ -802,7 +802,7 @@ func TestPrefFlagMapping(t *testing.T) {
 		}
 	}
 
-	prefType := reflect.TypeOf(ipn.Prefs{})
+	prefType := reflect.TypeFor[ipn.Prefs]()
 	for i := 0; i < prefType.NumField(); i++ {
 		prefName := prefType.Field(i).Name
 		if prefHasFlag[prefName] {
@@ -828,6 +828,10 @@ func TestPrefFlagMapping(t *testing.T) {
 		case "NetfilterKind":
 			// Handled by TS_DEBUG_FIREWALL_MODE env var, we don't want to have
 			// a CLI flag for this. The Pref is used by c2n.
+			continue
+		case "TailFSShares":
+			// Handled by the tailscale share subcommand, we don't want a CLI
+			// flag for this.
 			continue
 		}
 		t.Errorf("unexpected new ipn.Pref field %q is not handled by up.go (see addPrefFlagMapping and checkForAccidentalSettingReverts)", prefName)

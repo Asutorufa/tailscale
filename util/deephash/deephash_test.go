@@ -29,6 +29,7 @@ import (
 	"tailscale.com/types/ptr"
 	"tailscale.com/util/deephash/testtype"
 	"tailscale.com/util/dnsname"
+	"tailscale.com/util/hashx"
 	"tailscale.com/version"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/router"
@@ -39,6 +40,22 @@ type appendBytes []byte
 
 func (p appendBytes) AppendTo(b []byte) []byte {
 	return append(b, p...)
+}
+
+type selfHasherValueRecv struct {
+	emit uint64
+}
+
+func (s selfHasherValueRecv) Hash(h *hashx.Block512) {
+	h.HashUint64(s.emit)
+}
+
+type selfHasherPointerRecv struct {
+	emit uint64
+}
+
+func (s *selfHasherPointerRecv) Hash(h *hashx.Block512) {
+	h.HashUint64(s.emit)
 }
 
 func TestHash(t *testing.T) {
@@ -139,13 +156,7 @@ func TestHash(t *testing.T) {
 		{in: tuple{netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 168, 0, 1}), 1234), netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 168, 0, 1}), 1235)}, wantEq: false},
 		{in: tuple{netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 168, 0, 1}), 1234), netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 168, 0, 2}), 1234)}, wantEq: false},
 		{in: tuple{netip.Prefix{}, netip.Prefix{}}, wantEq: true},
-
-		// In go1.21 PrefixFrom will now return a zero value Prefix if the
-		// provided Addr is unspecified. This is a change from previous
-		// behavior, so we disable this test for now.
-		// TODO(#8419): renable after go1.21 is released.
-		// {in: tuple{netip.Prefix{}, netip.PrefixFrom(netip.Addr{}, 1)}, wantEq: true},
-
+		{in: tuple{netip.Prefix{}, netip.PrefixFrom(netip.Addr{}, 1)}, wantEq: true},
 		{in: tuple{netip.Prefix{}, netip.PrefixFrom(netip.AddrFrom4([4]byte{}), 0)}, wantEq: false},
 		{in: tuple{netip.PrefixFrom(netip.AddrFrom4([4]byte{}), 1), netip.PrefixFrom(netip.AddrFrom4([4]byte{}), 1)}, wantEq: true},
 		{in: tuple{netip.PrefixFrom(netip.AddrFrom4([4]byte{192, 168, 0, 1}), 1), netip.PrefixFrom(netip.AddrFrom4([4]byte{192, 168, 0, 1}), 1)}, wantEq: true},
@@ -169,6 +180,12 @@ func TestHash(t *testing.T) {
 			b[0] = 1
 			return b
 		}()))}, wantEq: false},
+		{in: tuple{&selfHasherPointerRecv{}, &selfHasherPointerRecv{}}, wantEq: true},
+		{in: tuple{(*selfHasherPointerRecv)(nil), (*selfHasherPointerRecv)(nil)}, wantEq: true},
+		{in: tuple{(*selfHasherPointerRecv)(nil), &selfHasherPointerRecv{}}, wantEq: false},
+		{in: tuple{&selfHasherPointerRecv{emit: 1}, &selfHasherPointerRecv{emit: 2}}, wantEq: false},
+		{in: tuple{selfHasherValueRecv{emit: 1}, selfHasherValueRecv{emit: 2}}, wantEq: false},
+		{in: tuple{selfHasherValueRecv{emit: 2}, selfHasherValueRecv{emit: 2}}, wantEq: true},
 	}
 
 	for _, tt := range tests {
@@ -806,7 +823,7 @@ func TestHashMapAcyclic(t *testing.T) {
 
 	hb := &hashBuffer{Hash: sha256.New()}
 
-	hash := lookupTypeHasher(reflect.TypeOf(m))
+	hash := lookupTypeHasher(reflect.TypeFor[map[int]string]())
 	for i := 0; i < 20; i++ {
 		va := reflect.ValueOf(&m).Elem()
 		hb.Reset()

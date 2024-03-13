@@ -22,8 +22,12 @@ var stringKeys = []Key{
 	PreferencesMenuVisibility,
 	ExitNodeMenuVisibility,
 	AutoUpdateVisibility,
+	ResetToDefaultsVisibility,
 	KeyExpirationNoticeTime,
 	PostureChecking,
+	ManagedByOrganizationName,
+	ManagedByCaption,
+	ManagedByURL,
 }
 
 var boolKeys = []Key{
