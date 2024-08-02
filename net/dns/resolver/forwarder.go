@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/netip"
@@ -24,11 +23,11 @@ import (
 	dns "golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/envknob"
+	"tailscale.com/health"
 	"tailscale.com/net/dns/publicdns"
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/neterror"
 	"tailscale.com/net/netmon"
-	"tailscale.com/net/netns"
 	"tailscale.com/net/sockstats"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/types/dnstype"
@@ -166,6 +165,23 @@ func clampEDNSSize(packet []byte, maxSize uint16) {
 	binary.BigEndian.PutUint16(opt[3:5], maxSize)
 }
 
+// dnsForwarderFailing should be raised when the forwarder is unable to reach the
+// upstream resolvers. This is a high severity warning as it results in "no internet".
+// This warning must be cleared when the forwarder is working again.
+//
+// We allow for 5 second grace period to ensure this is not raised for spurious errors
+// under the assumption that DNS queries are relatively frequent and a subsequent
+// successful query will clear any one-off errors.
+var dnsForwarderFailing = health.Register(&health.Warnable{
+	Code:                "dns-forward-failing",
+	Title:               "DNS unavailable",
+	Severity:            health.SeverityHigh,
+	DependsOn:           []*health.Warnable{health.NetworkStatusWarnable},
+	Text:                health.StaticMessage("Tailscale can't reach the configured DNS servers. Internet connectivity may be affected."),
+	ImpactsConnectivity: true,
+	TimeToVisible:       5 * time.Second,
+})
+
 type route struct {
 	Suffix    dnsname.FQDN
 	Resolvers []resolverAndDelay
@@ -187,9 +203,10 @@ type resolverAndDelay struct {
 // forwarder forwards DNS packets to a number of upstream nameservers.
 type forwarder struct {
 	logf    logger.Logf
-	netMon  *netmon.Monitor
+	netMon  *netmon.Monitor     // always non-nil
 	linkSel ForwardLinkSelector // TODO(bradfitz): remove this when tsdial.Dialer absorbs it
 	dialer  *tsdial.Dialer
+	health  *health.Tracker // always non-nil
 
 	controlKnobs *controlknobs.Knobs // or nil
 
@@ -213,19 +230,26 @@ type forwarder struct {
 	// /etc/resolv.conf is missing/corrupt, and the peerapi ExitDNS stub
 	// resolver lookup.
 	cloudHostFallback []resolverAndDelay
+
+	// missingUpstreamRecovery, if non-nil, is set called when a SERVFAIL is
+	// returned due to missing upstream resolvers.
+	//
+	// This should attempt to properly (re)set the upstream resolvers.
+	missingUpstreamRecovery func()
 }
 
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
-
-func newForwarder(logf logger.Logf, netMon *netmon.Monitor, linkSel ForwardLinkSelector, dialer *tsdial.Dialer, knobs *controlknobs.Knobs) *forwarder {
+func newForwarder(logf logger.Logf, netMon *netmon.Monitor, linkSel ForwardLinkSelector, dialer *tsdial.Dialer, health *health.Tracker, knobs *controlknobs.Knobs) *forwarder {
+	if netMon == nil {
+		panic("nil netMon")
+	}
 	f := &forwarder{
-		logf:         logger.WithPrefix(logf, "forward: "),
-		netMon:       netMon,
-		linkSel:      linkSel,
-		dialer:       dialer,
-		controlKnobs: knobs,
+		logf:                    logger.WithPrefix(logf, "forward: "),
+		netMon:                  netMon,
+		linkSel:                 linkSel,
+		dialer:                  dialer,
+		health:                  health,
+		controlKnobs:            knobs,
+		missingUpstreamRecovery: func() {},
 	}
 	f.ctx, f.ctxCancel = context.WithCancel(context.Background())
 	return f
@@ -394,12 +418,11 @@ func (f *forwarder) getKnownDoHClientForProvider(urlBase string) (c *http.Client
 	if err != nil {
 		return nil, false
 	}
-	nsDialer := netns.NewDialer(f.logf, f.netMon)
-	dialer := dnscache.Dialer(nsDialer.DialContext, &dnscache.Resolver{
+
+	dialer := dnscache.Dialer(f.getDialerType(), &dnscache.Resolver{
 		SingleHost:             dohURL.Hostname(),
 		SingleHostStaticResult: allIPs,
 		Logf:                   f.logf,
-		NetMon:                 f.netMon,
 	})
 	c = &http.Client{
 		Transport: &http.Transport{
@@ -573,7 +596,7 @@ func (f *forwarder) send(ctx context.Context, fq *forwardQuery, rr resolverAndDe
 	}
 
 	// Kick off the race between the UDP and TCP queries.
-	rh := race.New[[]byte](timeout, firstUDP, thenTCP)
+	rh := race.New(timeout, firstUDP, thenTCP)
 	resp, err := rh.Start(ctx)
 	if err == nil {
 		return resp, nil
@@ -691,6 +714,23 @@ func (f *forwarder) sendUDP(ctx context.Context, fq *forwardQuery, rr resolverAn
 	return out, nil
 }
 
+func (f *forwarder) getDialerType() dnscache.DialContextFunc {
+	if f.controlKnobs != nil && f.controlKnobs.UserDialUseRoutes.Load() {
+		// It is safe to use UserDial as it dials external servers without going through Tailscale
+		// and closes connections on interface change in the same way as SystemDial does,
+		// thus preventing DNS resolution issues when switching between WiFi and cellular,
+		// but can also dial an internal DNS server on the Tailnet or via a subnet router.
+		//
+		// TODO(nickkhyl): Update tsdial.Dialer to reuse the bart.Table we create in net/tstun.Wrapper
+		// to avoid having two bart tables in memory, especially on iOS. Once that's done,
+		// we can get rid of the nodeAttr/control knob and always use UserDial for DNS.
+		//
+		// See https://github.com/tailscale/tailscale/issues/12027.
+		return f.dialer.UserDial
+	}
+	return f.dialer.SystemDial
+}
+
 func (f *forwarder) sendTCP(ctx context.Context, fq *forwardQuery, rr resolverAndDelay) (ret []byte, err error) {
 	ipp, ok := rr.name.IPPort()
 	if !ok {
@@ -709,7 +749,7 @@ func (f *forwarder) sendTCP(ctx context.Context, fq *forwardQuery, rr resolverAn
 	ctx, cancel := context.WithTimeout(ctx, tcpQueryTimeout)
 	defer cancel()
 
-	conn, err := f.dialer.SystemDial(ctx, tcpFam, ipp.String())
+	conn, err := f.getDialerType()(ctx, tcpFam, ipp.String())
 	if err != nil {
 		return nil, err
 	}
@@ -851,7 +891,7 @@ func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, respo
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return fmt.Errorf("waiting to send NXDOMAIN: %w", ctx.Err())
 		case responseChan <- res:
 			return nil
 		}
@@ -867,7 +907,16 @@ func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, respo
 		resolvers = f.resolvers(domain)
 		if len(resolvers) == 0 {
 			metricDNSFwdErrorNoUpstream.Add(1)
+			f.health.SetUnhealthy(dnsForwarderFailing, health.Args{health.ArgDNSServers: ""})
 			f.logf("no upstream resolvers set, returning SERVFAIL")
+
+			// Attempt to recompile the DNS configuration
+			// If we are being asked to forward queries and we have no
+			// nameservers, the network is in a bad state.
+			if f.missingUpstreamRecovery != nil {
+				f.missingUpstreamRecovery()
+			}
+
 			res, err := servfailResponse(query)
 			if err != nil {
 				f.logf("building servfail response: %v", err)
@@ -877,10 +926,12 @@ func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, respo
 			}
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return fmt.Errorf("waiting to send SERVFAIL: %w", ctx.Err())
 			case responseChan <- res:
 				return nil
 			}
+		} else {
+			f.health.SetHealthy(dnsForwarderFailing)
 		}
 	}
 
@@ -907,6 +958,7 @@ func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, respo
 			}
 			resb, err := f.send(ctx, fq, *rr)
 			if err != nil {
+				err = fmt.Errorf("resolving using %q: %w", rr.name.Addr, err)
 				select {
 				case errc <- err:
 				case <-ctx.Done():
@@ -928,9 +980,10 @@ func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, respo
 			select {
 			case <-ctx.Done():
 				metricDNSFwdErrorContext.Add(1)
-				return ctx.Err()
+				return fmt.Errorf("waiting to send response: %w", ctx.Err())
 			case responseChan <- packet{v, query.family, query.addr}:
 				metricDNSFwdSuccess.Add(1)
+				f.health.SetHealthy(dnsForwarderFailing)
 				return nil
 			}
 		case err := <-errc:
@@ -950,6 +1003,11 @@ func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, respo
 					case <-ctx.Done():
 						metricDNSFwdErrorContext.Add(1)
 						metricDNSFwdErrorContextGotError.Add(1)
+						var resolverAddrs []string
+						for _, rr := range resolvers {
+							resolverAddrs = append(resolverAddrs, rr.name.Addr)
+						}
+						f.health.SetUnhealthy(dnsForwarderFailing, health.Args{health.ArgDNSServers: strings.Join(resolverAddrs, ",")})
 					case responseChan <- res:
 					}
 				}
@@ -961,7 +1019,17 @@ func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, respo
 				metricDNSFwdErrorContextGotError.Add(1)
 				return firstErr
 			}
-			return ctx.Err()
+
+			// If we haven't got an error or a successful response,
+			// include all resolvers in the error message so we can
+			// at least see what what servers we're trying to
+			// query.
+			var resolverAddrs []string
+			for _, rr := range resolvers {
+				resolverAddrs = append(resolverAddrs, rr.name.Addr)
+			}
+			f.health.SetUnhealthy(dnsForwarderFailing, health.Args{health.ArgDNSServers: strings.Join(resolverAddrs, ",")})
+			return fmt.Errorf("waiting for response or error from %v: %w", resolverAddrs, ctx.Err())
 		}
 	}
 }

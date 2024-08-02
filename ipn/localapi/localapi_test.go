@@ -9,11 +9,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -24,8 +31,10 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsd"
 	"tailscale.com/tstest"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
+	"tailscale.com/util/slicesx"
 	"tailscale.com/wgengine"
 )
 
@@ -91,44 +100,64 @@ func TestSetPushDeviceToken(t *testing.T) {
 }
 
 type whoIsBackend struct {
-	whoIs    func(ipp netip.AddrPort) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool)
-	peerCaps map[netip.Addr]tailcfg.PeerCapMap
+	whoIs        func(proto string, ipp netip.AddrPort) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool)
+	whoIsNodeKey func(key.NodePublic) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool)
+	peerCaps     map[netip.Addr]tailcfg.PeerCapMap
 }
 
-func (b whoIsBackend) WhoIs(ipp netip.AddrPort) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool) {
-	return b.whoIs(ipp)
+func (b whoIsBackend) WhoIs(proto string, ipp netip.AddrPort) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool) {
+	return b.whoIs(proto, ipp)
+}
+
+func (b whoIsBackend) WhoIsNodeKey(k key.NodePublic) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool) {
+	return b.whoIsNodeKey(k)
 }
 
 func (b whoIsBackend) PeerCaps(ip netip.Addr) tailcfg.PeerCapMap {
 	return b.peerCaps[ip]
 }
 
-// Tests that the WhoIs handler accepts either IPs or IP:ports.
+// Tests that the WhoIs handler accepts IPs, IP:ports, or nodekeys.
 //
 // From https://github.com/tailscale/tailscale/pull/9714 (a PR that is effectively a bug report)
-func TestWhoIsJustIP(t *testing.T) {
+//
+// And https://github.com/tailscale/tailscale/issues/12465
+func TestWhoIsArgTypes(t *testing.T) {
 	h := &Handler{
 		PermitRead: true,
 	}
-	for _, input := range []string{"100.101.102.103", "127.0.0.1:123"} {
+
+	match := func() (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool) {
+		return (&tailcfg.Node{
+				ID: 123,
+				Addresses: []netip.Prefix{
+					netip.MustParsePrefix("100.101.102.103/32"),
+				},
+			}).View(),
+			tailcfg.UserProfile{ID: 456, DisplayName: "foo"},
+			true
+	}
+
+	const keyStr = "nodekey:5c8f86d5fc70d924e55f02446165a5dae8f822994ad26bcf4b08fd841f9bf261"
+	for _, input := range []string{"100.101.102.103", "127.0.0.1:123", keyStr} {
 		rec := httptest.NewRecorder()
 		t.Run(input, func(t *testing.T) {
 			b := whoIsBackend{
-				whoIs: func(ipp netip.AddrPort) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool) {
+				whoIs: func(proto string, ipp netip.AddrPort) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool) {
 					if !strings.Contains(input, ":") {
 						want := netip.MustParseAddrPort("100.101.102.103:0")
 						if ipp != want {
 							t.Fatalf("backend called with %v; want %v", ipp, want)
 						}
 					}
-					return (&tailcfg.Node{
-							ID: 123,
-							Addresses: []netip.Prefix{
-								netip.MustParsePrefix("100.101.102.103/32"),
-							},
-						}).View(),
-						tailcfg.UserProfile{ID: 456, DisplayName: "foo"},
-						true
+					return match()
+				},
+				whoIsNodeKey: func(k key.NodePublic) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool) {
+					if k.String() != keyStr {
+						t.Fatalf("backend called with %v; want %v", k, keyStr)
+					}
+					return match()
+
 				},
 				peerCaps: map[netip.Addr]tailcfg.PeerCapMap{
 					netip.MustParseAddr("100.101.102.103"): map[tailcfg.PeerCapability][]tailcfg.RawMessage{
@@ -138,9 +167,12 @@ func TestWhoIsJustIP(t *testing.T) {
 			}
 			h.serveWhoIsWithBackend(rec, httptest.NewRequest("GET", "/v0/whois?addr="+url.QueryEscape(input), nil), b)
 
+			if rec.Code != 200 {
+				t.Fatalf("response code %d", rec.Code)
+			}
 			var res apitype.WhoIsResponse
 			if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
-				t.Fatal(err)
+				t.Fatalf("parsing response %#q: %v", rec.Body.Bytes(), err)
 			}
 			if got, want := res.Node.ID, tailcfg.NodeID(123); got != want {
 				t.Errorf("res.Node.ID=%v, want %v", got, want)
@@ -306,7 +338,7 @@ func newTestLocalBackend(t testing.TB) *ipnlocal.LocalBackend {
 	sys := new(tsd.System)
 	store := new(mem.Store)
 	sys.Set(store)
-	eng, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set)
+	eng, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker())
 	if err != nil {
 		t.Fatalf("NewFakeUserspaceEngine: %v", err)
 	}
@@ -317,4 +349,68 @@ func newTestLocalBackend(t testing.TB) *ipnlocal.LocalBackend {
 		t.Fatalf("NewLocalBackend: %v", err)
 	}
 	return lb
+}
+
+func TestKeepItSorted(t *testing.T) {
+	// Parse the localapi.go file into an AST.
+	fset := token.NewFileSet() // positions are relative to fset
+	src, err := os.ReadFile("localapi.go")
+	if err != nil {
+		log.Fatal(err)
+	}
+	f, err := parser.ParseFile(fset, "localapi.go", src, 0)
+	if err != nil {
+		log.Fatal(err)
+	}
+	getHandler := func() *ast.ValueSpec {
+		for _, d := range f.Decls {
+			if g, ok := d.(*ast.GenDecl); ok && g.Tok == token.VAR {
+				for _, s := range g.Specs {
+					if vs, ok := s.(*ast.ValueSpec); ok {
+						if len(vs.Names) == 1 && vs.Names[0].Name == "handler" {
+							return vs
+						}
+					}
+				}
+			}
+		}
+		return nil
+	}
+	keys := func() (ret []string) {
+		h := getHandler()
+		if h == nil {
+			t.Fatal("no handler var found")
+		}
+		cl, ok := h.Values[0].(*ast.CompositeLit)
+		if !ok {
+			t.Fatalf("handler[0] is %T, want *ast.CompositeLit", h.Values[0])
+		}
+		for _, e := range cl.Elts {
+			kv := e.(*ast.KeyValueExpr)
+			strLt := kv.Key.(*ast.BasicLit)
+			if strLt.Kind != token.STRING {
+				t.Fatalf("got: %T, %q", kv.Key, kv.Key)
+			}
+			k, err := strconv.Unquote(strLt.Value)
+			if err != nil {
+				t.Fatalf("unquote: %v", err)
+			}
+			ret = append(ret, k)
+		}
+		return
+	}
+	gotKeys := keys()
+	endSlash, noSlash := slicesx.Partition(keys(), func(s string) bool { return strings.HasSuffix(s, "/") })
+	if !slices.IsSorted(endSlash) {
+		t.Errorf("the items ending in a slash aren't sorted")
+	}
+	if !slices.IsSorted(noSlash) {
+		t.Errorf("the items ending in a slash aren't sorted")
+	}
+	if !t.Failed() {
+		want := append(endSlash, noSlash...)
+		if !slices.Equal(gotKeys, want) {
+			t.Errorf("items with trailing slashes should precede those without")
+		}
+	}
 }

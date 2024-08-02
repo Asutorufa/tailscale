@@ -1,9 +1,12 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+// Package ipnlocal is the heart of the Tailscale node agent that controls
+// all the other misc pieces of the Tailscale node.
 package ipnlocal
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/base64"
@@ -14,13 +17,15 @@ import (
 	"log"
 	"maps"
 	"math"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
 	"os"
-	"os/user"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"sort"
@@ -43,6 +48,7 @@ import (
 	"tailscale.com/doctor/ethtool"
 	"tailscale.com/doctor/permissions"
 	"tailscale.com/doctor/routetable"
+	"tailscale.com/drive"
 	"tailscale.com/envknob"
 	"tailscale.com/health"
 	"tailscale.com/health/healthmsg"
@@ -54,10 +60,12 @@ import (
 	"tailscale.com/ipn/policy"
 	"tailscale.com/log/sockstatlog"
 	"tailscale.com/logpolicy"
+	"tailscale.com/net/captivedetection"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/dnsfallback"
-	"tailscale.com/net/interfaces"
+	"tailscale.com/net/ipset"
+	"tailscale.com/net/netcheck"
 	"tailscale.com/net/netkernelconf"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
@@ -69,7 +77,6 @@ import (
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/taildrop"
-	"tailscale.com/tailfs"
 	"tailscale.com/tka"
 	"tailscale.com/tsd"
 	"tailscale.com/tstime"
@@ -77,6 +84,7 @@ import (
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/empty"
 	"tailscale.com/types/key"
+	"tailscale.com/types/lazy"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
 	"tailscale.com/types/netmap"
@@ -91,6 +99,7 @@ import (
 	"tailscale.com/util/mak"
 	"tailscale.com/util/multierr"
 	"tailscale.com/util/osshare"
+	"tailscale.com/util/osuser"
 	"tailscale.com/util/rands"
 	"tailscale.com/util/set"
 	"tailscale.com/util/syspolicy"
@@ -120,6 +129,10 @@ func getControlDebugFlags() []string {
 // SSHServer is the interface of the conditionally linked ssh/tailssh.server.
 type SSHServer interface {
 	HandleSSHConn(net.Conn) error
+
+	// NumActiveConns returns the number of connections passed to HandleSSHConn
+	// that are still active.
+	NumActiveConns() int
 
 	// OnPolicyChange is called when the SSH access policy changes,
 	// so that existing sessions can be re-evaluated for validity
@@ -164,6 +177,7 @@ type LocalBackend struct {
 	keyLogf               logger.Logf        // for printing list of peers on change
 	statsLogf             logger.Logf        // for printing peers stats on change
 	sys                   *tsd.System
+	health                *health.Tracker // always non-nil
 	e                     wgengine.Engine // non-nil; TODO(bradfitz): remove; use sys
 	store                 ipn.StateStore  // non-nil; TODO(bradfitz): remove; use sys
 	dialer                *tsdial.Dialer  // non-nil; TODO(bradfitz): remove; use sys
@@ -204,10 +218,6 @@ type LocalBackend struct {
 	// is never called.
 	getTCPHandlerForFunnelFlow func(srcAddr netip.AddrPort, dstPort uint16) (handler func(net.Conn))
 
-	// lastProfileID tracks the last profile we've seen from the ProfileManager.
-	// It's used to detect when the user has changed their profile.
-	lastProfileID ipn.ProfileID
-
 	filterAtomic                 atomic.Pointer[filter.Filter]
 	containsViaIPFuncAtomic      syncs.AtomicValue[func(netip.Addr) bool]
 	shouldInterceptTCPPortAtomic syncs.AtomicValue[func(uint16) bool]
@@ -222,7 +232,8 @@ type LocalBackend struct {
 	ccGen          clientGen          // function for producing controlclient; lazily populated
 	sshServer      SSHServer          // or nil, initialized lazily.
 	appConnector   *appc.AppConnector // or nil, initialized when configured.
-	notify         func(ipn.Notify)
+	// notifyCancel cancels notifications to the current SetNotifyCallback.
+	notifyCancel   context.CancelFunc
 	cc             controlclient.Client
 	ccAuto         *controlclient.Auto // if cc is of type *controlclient.Auto
 	machinePrivKey key.MachinePrivate
@@ -243,19 +254,17 @@ type LocalBackend struct {
 	// delta node mutations as they come in (with mu held). The map values can
 	// be given out to callers, but the map itself must not escape the LocalBackend.
 	peers            map[tailcfg.NodeID]tailcfg.NodeView
-	nodeByAddr       map[netip.Addr]tailcfg.NodeID
-	nmExpiryTimer    tstime.TimerController // for updating netMap on node expiry; can be nil
-	activeLogin      string                 // last logged LoginName from netMap
+	nodeByAddr       map[netip.Addr]tailcfg.NodeID // by Node.Addresses only (not subnet routes)
+	nmExpiryTimer    tstime.TimerController        // for updating netMap on node expiry; can be nil
+	activeLogin      string                        // last logged LoginName from netMap
 	engineStatus     ipn.EngineStatus
 	endpoints        []tailcfg.Endpoint
 	blocked          bool
 	keyExpired       bool
-	authURL          string    // cleared on Notify
-	authURLSticky    string    // not cleared on Notify
+	authURL          string    // non-empty if not Running
 	authURLTime      time.Time // when the authURL was received from the control server
-	interact         bool
 	egg              bool
-	prevIfState      *interfaces.State
+	prevIfState      *netmon.State
 	peerAPIServer    *peerAPIServer // or nil
 	peerAPIListeners []*peerAPIListener
 	loginFlags       controlclient.LoginFlags
@@ -284,6 +293,13 @@ type LocalBackend struct {
 	// capForcedNetfilter is the netfilter that control instructs Linux clients
 	// to use, unless overridden locally.
 	capForcedNetfilter string
+	// offlineAutoUpdateCancel stops offline auto-updates when called. It
+	// should be used via stopOfflineAutoUpdate and
+	// maybeStartOfflineAutoUpdate. It is nil when offline auto-updates are
+	// note running.
+	//
+	//lint:ignore U1000 only used in Linux and Windows builds in autoupdate.go
+	offlineAutoUpdateCancel func()
 
 	// ServeConfig fields. (also guarded by mu)
 	lastServeConfJSON mem.RO              // last JSON that was parsed into serveConfig
@@ -316,12 +332,44 @@ type LocalBackend struct {
 	// Last ClientVersion received in MapResponse, guarded by mu.
 	lastClientVersion *tailcfg.ClientVersion
 
-	// lastNotifiedTailFSShares keeps track of the last set of shares that we
+	// lastNotifiedDriveShares keeps track of the last set of shares that we
 	// notified about.
-	lastNotifiedTailFSShares atomic.Pointer[views.SliceView[*tailfs.Share, tailfs.ShareView]]
+	lastNotifiedDriveShares atomic.Pointer[views.SliceView[*drive.Share, drive.ShareView]]
 
 	// outgoingFiles keeps track of Taildrop outgoing files keyed to their OutgoingFile.ID
 	outgoingFiles map[string]*ipn.OutgoingFile
+
+	// lastSuggestedExitNode stores the last suggested exit node suggestion to
+	// avoid unnecessary churn between multiple equally-good options.
+	lastSuggestedExitNode tailcfg.StableNodeID
+
+	// refreshAutoExitNode indicates if the exit node should be recomputed when the next netcheck report is available.
+	refreshAutoExitNode bool
+
+	// captiveCtx and captiveCancel are used to control captive portal
+	// detection. They are protected by 'mu' and can be changed during the
+	// lifetime of a LocalBackend.
+	//
+	// captiveCtx will always be non-nil, though it might be a canceled
+	// context. captiveCancel is non-nil if checkCaptivePortalLoop is
+	// running, and is set to nil after being canceled.
+	captiveCtx    context.Context
+	captiveCancel context.CancelFunc
+	// needsCaptiveDetection is a channel that is used to signal either
+	// that captive portal detection is required (sending true) or that the
+	// backend is healthy and captive portal detection is not required
+	// (sending false).
+	needsCaptiveDetection chan bool
+}
+
+// HealthTracker returns the health tracker for the backend.
+func (b *LocalBackend) HealthTracker() *health.Tracker {
+	return b.health
+}
+
+// NetMon returns the network monitor for the backend.
+func (b *LocalBackend) NetMon() *netmon.Monitor {
+	return b.sys.NetMon.Get()
 }
 
 type updateStatus struct {
@@ -340,13 +388,19 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 	e := sys.Engine.Get()
 	store := sys.StateStore.Get()
 	dialer := sys.Dialer.Get()
-	_ = sys.MagicSock.Get() // or panic
+	if dialer == nil {
+		return nil, errors.New("dialer to NewLocalBackend must be set")
+	}
+	if dialer.NetMon() == nil {
+		return nil, errors.New("dialer to NewLocalBackend must have a NetMon")
+	}
+	mConn := sys.MagicSock.Get()
 
 	goos := envknob.GOOS()
 	if loginFlags&controlclient.LocalBackendStartKeyOSNeutral != 0 {
 		goos = ""
 	}
-	pm, err := newProfileManagerWithGOOS(store, logf, goos)
+	pm, err := newProfileManagerWithGOOS(store, logf, sys.HealthTracker(), goos)
 	if err != nil {
 		return nil, err
 	}
@@ -354,64 +408,64 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 		sds.SetDialer(dialer.SystemDial)
 	}
 
-	if sys.InitialConfig != nil {
-		p := pm.CurrentPrefs().AsStruct()
-		mp, err := sys.InitialConfig.Parsed.ToPrefs()
-		if err != nil {
-			return nil, err
-		}
-		p.ApplyEdits(&mp)
-		if err := pm.SetPrefs(p.View(), ipn.NetworkProfile{}); err != nil {
-			return nil, err
-		}
-	}
-
 	envknob.LogCurrent(logf)
-	if dialer == nil {
-		dialer = &tsdial.Dialer{Logf: logf}
-	}
-
 	osshare.SetFileSharingEnabled(false, logf)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	portpoll := new(portlist.Poller)
 	clock := tstime.StdClock{}
 
+	// Until we transition to a Running state, use a canceled context for
+	// our captive portal detection.
+	captiveCtx, captiveCancel := context.WithCancel(ctx)
+	captiveCancel()
+
 	b := &LocalBackend{
-		ctx:                 ctx,
-		ctxCancel:           cancel,
-		logf:                logf,
-		keyLogf:             logger.LogOnChange(logf, 5*time.Minute, clock.Now),
-		statsLogf:           logger.LogOnChange(logf, 5*time.Minute, clock.Now),
-		sys:                 sys,
-		conf:                sys.InitialConfig,
-		e:                   e,
-		dialer:              dialer,
-		store:               store,
-		pm:                  pm,
-		backendLogID:        logID,
-		state:               ipn.NoState,
-		portpoll:            portpoll,
-		em:                  newExpiryManager(logf),
-		gotPortPollRes:      make(chan struct{}),
-		loginFlags:          loginFlags,
-		clock:               clock,
-		selfUpdateProgress:  make([]ipnstate.UpdateProgress, 0),
-		lastSelfUpdateState: ipnstate.UpdateFinished,
+		ctx:                   ctx,
+		ctxCancel:             cancel,
+		logf:                  logf,
+		keyLogf:               logger.LogOnChange(logf, 5*time.Minute, clock.Now),
+		statsLogf:             logger.LogOnChange(logf, 5*time.Minute, clock.Now),
+		sys:                   sys,
+		health:                sys.HealthTracker(),
+		e:                     e,
+		dialer:                dialer,
+		store:                 store,
+		pm:                    pm,
+		backendLogID:          logID,
+		state:                 ipn.NoState,
+		portpoll:              new(portlist.Poller),
+		em:                    newExpiryManager(logf),
+		gotPortPollRes:        make(chan struct{}),
+		loginFlags:            loginFlags,
+		clock:                 clock,
+		selfUpdateProgress:    make([]ipnstate.UpdateProgress, 0),
+		lastSelfUpdateState:   ipnstate.UpdateFinished,
+		captiveCtx:            captiveCtx,
+		captiveCancel:         nil, // so that we start checkCaptivePortalLoop when Running
+		needsCaptiveDetection: make(chan bool),
+	}
+	mConn.SetNetInfoCallback(b.setNetInfo)
+
+	if sys.InitialConfig != nil {
+		if err := b.setConfigLocked(sys.InitialConfig); err != nil {
+			return nil, err
+		}
 	}
 
 	netMon := sys.NetMon.Get()
-	b.sockstatLogger, err = sockstatlog.NewLogger(logpolicy.LogsDir(logf), logf, logID, netMon)
+	b.sockstatLogger, err = sockstatlog.NewLogger(logpolicy.LogsDir(logf), logf, logID, netMon, sys.HealthTracker())
 	if err != nil {
 		log.Printf("error setting up sockstat logger: %v", err)
 	}
-	// Enable sockstats logs only on unstable builds
-	if version.IsUnstableBuild() && b.sockstatLogger != nil {
+	// Enable sockstats logs only on non-mobile unstable builds
+	if version.IsUnstableBuild() && !version.IsMobile() && b.sockstatLogger != nil {
 		b.sockstatLogger.SetLoggingEnabled(true)
 	}
 
 	// Default filter blocks everything and logs nothing, until Start() is called.
-	b.setFilter(filter.NewAllowNone(logf, &netipx.IPSet{}))
+	noneFilter := filter.NewAllowNone(logf, &netipx.IPSet{})
+	b.setFilter(noneFilter)
+	b.e.SetJailedFilter(noneFilter)
 
 	b.setTCPPortsIntercepted(nil)
 
@@ -424,7 +478,7 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 	b.linkChange(&netmon.ChangeDelta{New: netMon.InterfaceState()})
 	b.unregisterNetMon = netMon.RegisterChangeCallback(b.linkChange)
 
-	b.unregisterHealthWatch = health.RegisterWatcher(b.onHealthChange)
+	b.unregisterHealthWatch = b.health.RegisterWatcher(b.onHealthChange)
 
 	if tunWrap, ok := b.sys.Tun.GetOK(); ok {
 		tunWrap.PeerAPIPort = b.GetPeerAPIPort
@@ -442,13 +496,13 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 		}
 	}
 
-	// initialize TailFS shares from saved state
-	fs, ok := b.sys.TailFSForRemote.GetOK()
+	// initialize Taildrive shares from saved state
+	fs, ok := b.sys.DriveForRemote.GetOK()
 	if ok {
-		currentShares := b.pm.prefs.TailFSShares()
+		currentShares := b.pm.prefs.DriveShares()
 		if currentShares.Len() > 0 {
-			var shares []*tailfs.Share
-			for i := 0; i < currentShares.Len(); i++ {
+			var shares []*drive.Share
+			for i := range currentShares.Len() {
 				shares = append(shares, currentShares.At(i).AsStruct())
 			}
 			fs.SetShares(shares)
@@ -580,10 +634,51 @@ func (b *LocalBackend) ReloadConfig() (ok bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	b.conf = conf
-	// TODO(bradfitz): apply things
+	if err := b.setConfigLocked(conf); err != nil {
+		return false, fmt.Errorf("error setting config: %w", err)
+	}
+
 	return true, nil
 }
+
+func (b *LocalBackend) setConfigLocked(conf *conffile.Config) error {
+
+	// TODO(irbekrm): notify the relevant components to consume any prefs
+	// updates. Currently only initial configfile settings are applied
+	// immediately.
+	p := b.pm.CurrentPrefs().AsStruct()
+	mp, err := conf.Parsed.ToPrefs()
+	if err != nil {
+		return fmt.Errorf("error parsing config to prefs: %w", err)
+	}
+	p.ApplyEdits(&mp)
+	if err := b.pm.SetPrefs(p.View(), ipn.NetworkProfile{}); err != nil {
+		return err
+	}
+
+	defer func() {
+		b.conf = conf
+	}()
+
+	if conf.Parsed.StaticEndpoints == nil && (b.conf == nil || b.conf.Parsed.StaticEndpoints == nil) {
+		return nil
+	}
+
+	// Ensure that magicsock conn has the up to date static wireguard
+	// endpoints. Setting the endpoints here triggers an asynchronous update
+	// of the node's advertised endpoints.
+	if b.conf == nil && len(conf.Parsed.StaticEndpoints) != 0 || !reflect.DeepEqual(conf.Parsed.StaticEndpoints, b.conf.Parsed.StaticEndpoints) {
+		ms, ok := b.sys.MagicSock.GetOK()
+		if !ok {
+			b.logf("[unexpected] ReloadConfig: MagicSock not set")
+		} else {
+			ms.SetStaticEndpoints(views.SliceOf(conf.Parsed.StaticEndpoints))
+		}
+	}
+	return nil
+}
+
+var assumeNetworkUpdateForTest = envknob.RegisterBool("TS_ASSUME_NETWORK_UP_FOR_TEST")
 
 // pauseOrResumeControlClientLocked pauses b.cc if there is no network available
 // or if the LocalBackend is in Stopped state with a valid NetMap. In all other
@@ -595,8 +690,12 @@ func (b *LocalBackend) pauseOrResumeControlClientLocked() {
 		return
 	}
 	networkUp := b.prevIfState.AnyInterfaceUp()
-	b.cc.SetPaused((b.state == ipn.Stopped && b.netMap != nil) || (!networkUp && !testenv.InTest()))
+	b.cc.SetPaused((b.state == ipn.Stopped && b.netMap != nil) || (!networkUp && !testenv.InTest() && !assumeNetworkUpdateForTest()))
 }
+
+// captivePortalDetectionInterval is the duration to wait in an unhealthy state with connectivity broken
+// before running captive portal detection.
+const captivePortalDetectionInterval = 2 * time.Second
 
 // linkChange is our network monitor callback, called whenever the network changes.
 func (b *LocalBackend) linkChange(delta *netmon.ChangeDelta) {
@@ -607,7 +706,9 @@ func (b *LocalBackend) linkChange(delta *netmon.ChangeDelta) {
 	hadPAC := b.prevIfState.HasPAC()
 	b.prevIfState = ifst
 	b.pauseOrResumeControlClientLocked()
-
+	if delta.Major && shouldAutoExitNode() {
+		b.refreshAutoExitNode = true
+	}
 	// If the PAC-ness of the network changed, reconfig wireguard+route to
 	// add/remove subnets.
 	if hadPAC != ifst.HasPAC() {
@@ -623,7 +724,7 @@ func (b *LocalBackend) linkChange(delta *netmon.ChangeDelta) {
 	// If the local network configuration has changed, our filter may
 	// need updating to tweak default routes.
 	b.updateFilterLocked(b.netMap, b.pm.CurrentPrefs())
-	updateExitNodeUsageWarning(b.pm.CurrentPrefs(), delta.New)
+	updateExitNodeUsageWarning(b.pm.CurrentPrefs(), delta.New, b.health)
 
 	if peerAPIListenAsync && b.netMap != nil && b.state == ipn.Running {
 		want := b.netMap.GetAddresses().Len()
@@ -634,11 +735,58 @@ func (b *LocalBackend) linkChange(delta *netmon.ChangeDelta) {
 	}
 }
 
-func (b *LocalBackend) onHealthChange(sys health.Subsystem, err error) {
-	if err == nil {
-		b.logf("health(%q): ok", sys)
+func (b *LocalBackend) onHealthChange(w *health.Warnable, us *health.UnhealthyState) {
+	if us == nil {
+		b.logf("health(warnable=%s): ok", w.Code)
 	} else {
-		b.logf("health(%q): error: %v", sys, err)
+		b.logf("health(warnable=%s): error: %s", w.Code, us.Text)
+	}
+
+	// Whenever health changes, send the current health state to the frontend.
+	state := b.health.CurrentState()
+	b.send(ipn.Notify{
+		Health: state,
+	})
+
+	isConnectivityImpacted := false
+	for _, w := range state.Warnings {
+		// Ignore the captive portal warnable itself.
+		if w.ImpactsConnectivity && w.WarnableCode != captivePortalWarnable.Code {
+			isConnectivityImpacted = true
+			break
+		}
+	}
+
+	// captiveCtx can be changed, and is protected with 'mu'; grab that
+	// before we start our select, below.
+	//
+	// It is guaranteed to be non-nil.
+	b.mu.Lock()
+	ctx := b.captiveCtx
+	b.mu.Unlock()
+
+	// If the context is canceled, we don't need to do anything.
+	if ctx.Err() != nil {
+		return
+	}
+
+	if isConnectivityImpacted {
+		b.logf("health: connectivity impacted; triggering captive portal detection")
+
+		// Ensure that we select on captiveCtx so that we can time out
+		// triggering captive portal detection if the backend is shutdown.
+		select {
+		case b.needsCaptiveDetection <- true:
+		case <-ctx.Done():
+		}
+	} else {
+		// If connectivity is not impacted, we know for sure we're not behind a captive portal,
+		// so drop any warning, and signal that we don't need captive portal detection.
+		b.health.SetHealthy(captivePortalWarnable)
+		select {
+		case b.needsCaptiveDetection <- false:
+		case <-ctx.Done():
+		}
 	}
 }
 
@@ -651,6 +799,11 @@ func (b *LocalBackend) Shutdown() {
 		return
 	}
 	b.shutdownCalled = true
+
+	if b.captiveCancel != nil {
+		b.logf("canceling captive portal context")
+		b.captiveCancel()
+	}
 
 	if b.loginFlags&controlclient.LoginEphemeral != 0 {
 		b.mu.Unlock()
@@ -677,15 +830,21 @@ func (b *LocalBackend) Shutdown() {
 		b.debugSink.Close()
 		b.debugSink = nil
 	}
+	if b.notifyCancel != nil {
+		b.notifyCancel()
+	}
 	b.mu.Unlock()
 	b.webClientShutdown()
 
 	if b.sockstatLogger != nil {
-		b.sockstatLogger.Shutdown()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		b.sockstatLogger.Shutdown(ctx)
 	}
 	if b.peerAPIServer != nil {
 		b.peerAPIServer.taildrop.Shutdown()
 	}
+	b.stopOfflineAutoUpdate()
 
 	b.unregisterNetMon()
 	b.unregisterHealthWatch()
@@ -748,32 +907,17 @@ func (b *LocalBackend) UpdateStatus(sb *ipnstate.StatusBuilder) {
 		s.Version = version.Long()
 		s.TUN = !b.sys.IsNetstack()
 		s.BackendState = b.state.String()
-		s.AuthURL = b.authURLSticky
+		s.AuthURL = b.authURL
 		if prefs := b.pm.CurrentPrefs(); prefs.Valid() && prefs.AutoUpdate().Check {
 			s.ClientVersion = b.lastClientVersion
-			if cv := b.lastClientVersion; cv != nil && !cv.RunningLatest && cv.LatestVersion != "" {
-				if cv.UrgentSecurityUpdate {
-					s.Health = append(s.Health, fmt.Sprintf("Security update available: %v -> %v, run `tailscale update` or `tailscale set --auto-update` to update", version.Short(), cv.LatestVersion))
-				} else {
-					s.Health = append(s.Health, fmt.Sprintf("Update available: %v -> %v, run `tailscale update` or `tailscale set --auto-update` to update", version.Short(), cv.LatestVersion))
-				}
-			}
 		}
-		if err := health.OverallError(); err != nil {
-			switch e := err.(type) {
-			case multierr.Error:
-				for _, err := range e.Errors() {
-					s.Health = append(s.Health, err.Error())
-				}
-			default:
-				s.Health = append(s.Health, err.Error())
-			}
-		}
+		s.Health = b.health.Strings()
+		s.HaveNodeKey = b.hasNodeKeyLocked()
+
+		// TODO(bradfitz): move this health check into a health.Warnable
+		// and remove from here.
 		if m := b.sshOnButUnusableHealthCheckMessageLocked(); m != "" {
 			s.Health = append(s.Health, m)
-		}
-		if version.IsUnstableBuild() {
-			s.Health = append(s.Health, "This is an unstable (development) version of Tailscale; frequent updates and bugs are likely")
 		}
 		if b.netMap != nil {
 			s.CertDomains = append([]string(nil), b.netMap.DNS.CertDomains...)
@@ -818,7 +962,7 @@ func (b *LocalBackend) UpdateStatus(sb *ipnstate.StatusBuilder) {
 
 	sb.MutateSelfStatus(func(ss *ipnstate.PeerStatus) {
 		ss.OS = version.OS()
-		ss.Online = health.GetInPollNetMap()
+		ss.Online = b.health.GetInPollNetMap()
 		if b.netMap != nil {
 			ss.InNetworkMap = true
 			if hi := b.netMap.SelfNode.Hostinfo(); hi.Valid() {
@@ -894,6 +1038,14 @@ func (b *LocalBackend) populatePeerStatusLocked(sb *ipnstate.StatusBuilder) {
 			ExitNode:        p.StableID() != "" && p.StableID() == exitNodeID,
 			SSH_HostKeys:    p.Hostinfo().SSH_HostKeys().AsSlice(),
 			Location:        p.Hostinfo().Location(),
+			Capabilities:    p.Capabilities().AsSlice(),
+		}
+		if cm := p.CapMap(); cm.Len() > 0 {
+			ps.CapMap = make(tailcfg.NodeCapMap, cm.Len())
+			cm.Range(func(k tailcfg.NodeCapability, v views.Slice[tailcfg.RawMessage]) bool {
+				ps.CapMap[k] = v.AsSlice()
+				return true
+			})
 		}
 		peerStatusFromNode(ps, p)
 
@@ -937,10 +1089,37 @@ func peerStatusFromNode(ps *ipnstate.PeerStatus, n tailcfg.NodeView) {
 	}
 }
 
+// WhoIsNodeKey returns the peer info of given public key, if it exists.
+func (b *LocalBackend) WhoIsNodeKey(k key.NodePublic) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// TODO(bradfitz): add nodeByKey like nodeByAddr instead of walking peers.
+	if b.netMap == nil {
+		return n, u, false
+	}
+	if self := b.netMap.SelfNode; self.Valid() && self.Key() == k {
+		return self, b.netMap.UserProfiles[self.User()], true
+	}
+	for _, n := range b.peers {
+		if n.Key() == k {
+			u, ok = b.netMap.UserProfiles[n.User()]
+			return n, u, ok
+		}
+	}
+	return n, u, false
+}
+
 // WhoIs reports the node and user who owns the node with the given IP:port.
 // If the IP address is a Tailscale IP, the provided port may be 0.
+//
+// The 'proto' is used when looking up the IP:port in our proxy mapper; it
+// tracks which local IP:ports correspond to connections proxied by tailscaled,
+// and since tailscaled proxies both TCP and UDP, the 'proto' is needed to look
+// up the correct IP:port based on the connection's protocol. If not provided,
+// the lookup will be done for TCP and then UDP, in that order.
+//
 // If ok == true, n and u are valid.
-func (b *LocalBackend) WhoIs(ipp netip.AddrPort) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool) {
+func (b *LocalBackend) WhoIs(proto string, ipp netip.AddrPort) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool) {
 	var zero tailcfg.NodeView
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -949,7 +1128,20 @@ func (b *LocalBackend) WhoIs(ipp netip.AddrPort) (n tailcfg.NodeView, u tailcfg.
 	if !ok {
 		var ip netip.Addr
 		if ipp.Port() != 0 {
-			ip, ok = b.sys.ProxyMapper().WhoIsIPPort(ipp)
+			var protos []string
+			if proto != "" {
+				protos = []string{proto}
+			} else {
+				// If the user didn't specify a protocol, try all of them
+				protos = []string{"tcp", "udp"}
+			}
+
+			for _, tryproto := range protos {
+				ip, ok = b.sys.ProxyMapper().WhoIsIPPort(tryproto, ipp)
+				if ok {
+					break
+				}
+			}
 		}
 		if !ok {
 			return zero, u, false
@@ -1010,15 +1202,16 @@ func (b *LocalBackend) peerCapsLocked(src netip.Addr) tailcfg.PeerCapMap {
 // SetControlClientStatus is the callback invoked by the control client whenever it posts a new status.
 // Among other things, this is where we update the netmap, packet filters, DNS and DERP maps.
 func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st controlclient.Status) {
-	b.mu.Lock()
+	unlock := b.lockAndGetUnlock()
+	defer unlock()
+
 	if b.cc != c {
 		b.logf("Ignoring SetControlClientStatus from old client")
-		b.mu.Unlock()
 		return
 	}
-	// The following do not depend on any data for which we need to lock b.
 	if st.Err != nil {
-		b.mu.Unlock()
+		// The following do not depend on any data for which we need b locked.
+		unlock.UnlockEarly()
 		if errors.Is(st.Err, io.EOF) {
 			b.logf("[v1] Received error: EOF")
 			return
@@ -1085,7 +1278,8 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 		}
 		b.keyExpired = isExpired
 	}
-	b.mu.Unlock()
+
+	unlock.UnlockEarly()
 
 	if keyExpiryExtended && wasBlocked {
 		// Key extended, unblock the engine
@@ -1101,13 +1295,18 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 		b.send(ipn.Notify{LoginFinished: &empty.Message{}})
 	}
 
-	// Lock b once and do only the things that require locking.
+	// Lock b again and do only the things that require locking.
 	b.mu.Lock()
 
 	prefsChanged := false
 	prefs := b.pm.CurrentPrefs().AsStruct()
-	netMap := b.netMap
-	interact := b.interact
+	oldNetMap := b.netMap
+	curNetMap := st.NetMap
+	if curNetMap == nil {
+		// The status didn't include a netmap update, so the old one is still
+		// current.
+		curNetMap = oldNetMap
+	}
 
 	if prefs.ControlURL == "" {
 		// Once we get a message from the control plane, set
@@ -1126,7 +1325,6 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 	}
 	if st.URL != "" {
 		b.authURL = st.URL
-		b.authURLSticky = st.URL
 		b.authURLTime = b.clock.Now()
 	}
 	if (wasBlocked || b.seamlessRenewalEnabled()) && st.LoginFinished() {
@@ -1139,7 +1337,14 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 		prefs.WantRunning = true
 		prefs.LoggedOut = false
 	}
-	if setExitNodeID(prefs, st.NetMap) {
+	if shouldAutoExitNode() {
+		// Re-evaluate exit node suggestion in case circumstances have changed.
+		_, err := b.suggestExitNodeLocked(curNetMap)
+		if err != nil && !errors.Is(err, ErrNoPreferredDERP) {
+			b.logf("SetControlClientStatus failed to select auto exit node: %v", err)
+		}
+	}
+	if setExitNodeID(prefs, curNetMap, b.lastSuggestedExitNode) {
 		prefsChanged = true
 	}
 	if applySysPolicy(prefs) {
@@ -1156,8 +1361,8 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 	if prefsChanged {
 		// Prefs will be written out if stale; this is not safe unless locked or cloned.
 		if err := b.pm.SetPrefs(prefs.View(), ipn.NetworkProfile{
-			MagicDNSName: st.NetMap.MagicDNSSuffix(),
-			DomainName:   st.NetMap.DomainName(),
+			MagicDNSName: curNetMap.MagicDNSSuffix(),
+			DomainName:   curNetMap.DomainName(),
 		}); err != nil {
 			b.logf("Failed to save new controlclient state: %v", err)
 		}
@@ -1209,7 +1414,7 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 	if st.NetMap != nil {
 		if envknob.NoLogsNoSupport() && st.NetMap.HasCap(tailcfg.CapabilityDataPlaneAuditLogs) {
 			msg := "tailnet requires logging to be enabled. Remove --no-logs-no-support from tailscaled command line."
-			health.SetLocalLogConfigHealth(errors.New(msg))
+			b.health.SetLocalLogConfigHealth(errors.New(msg))
 			// Connecting to this tailnet without logging is forbidden; boot us outta here.
 			b.mu.Lock()
 			prefs.WantRunning = false
@@ -1224,8 +1429,8 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 			b.send(ipn.Notify{ErrMessage: &msg, Prefs: &p})
 			return
 		}
-		if netMap != nil {
-			diff := st.NetMap.ConciseDiffFrom(netMap)
+		if oldNetMap != nil {
+			diff := st.NetMap.ConciseDiffFrom(oldNetMap)
 			if strings.TrimSpace(diff) == "" {
 				b.logf("[v1] netmap diff: (none)")
 			} else {
@@ -1240,13 +1445,14 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 		// Update our cached DERP map
 		dnsfallback.UpdateCache(st.NetMap.DERPMap, b.logf)
 
+		// Update the DERP map in the health package, which uses it for health notifications
+		b.health.SetDERPMap(st.NetMap.DERPMap)
+
 		b.send(ipn.Notify{NetMap: st.NetMap})
 	}
 	if st.URL != "" {
 		b.logf("Received auth URL: %.20v...", st.URL)
-		if interact {
-			b.popBrowserAuthNow()
-		}
+		b.popBrowserAuthNow()
 	}
 	b.stateMachine()
 	// This is currently (2020-07-28) necessary; conditionally disabling it is fragile!
@@ -1341,9 +1547,8 @@ func (b *LocalBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 			b.send(*notify)
 		}
 	}()
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	unlock := b.lockAndGetUnlock()
+	defer unlock()
 	if !b.updateNetmapDeltaLocked(muts) {
 		return false
 	}
@@ -1351,8 +1556,14 @@ func (b *LocalBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 	if b.netMap != nil && mutationsAreWorthyOfTellingIPNBus(muts) {
 		nm := ptr.To(*b.netMap) // shallow clone
 		nm.Peers = make([]tailcfg.NodeView, 0, len(b.peers))
+		shouldAutoExitNode := shouldAutoExitNode()
 		for _, p := range b.peers {
 			nm.Peers = append(nm.Peers, p)
+			// If the auto exit node currently set goes offline, find another auto exit node.
+			if shouldAutoExitNode && b.pm.prefs.ExitNodeID() == p.StableID() && p.Online() != nil && !*p.Online() {
+				b.setAutoExitNodeIDLockedOnEntry(unlock)
+				return false
+			}
 		}
 		slices.SortFunc(nm.Peers, func(a, b tailcfg.NodeView) int {
 			return cmp.Compare(a.ID(), b.ID())
@@ -1414,9 +1625,14 @@ func (b *LocalBackend) updateNetmapDeltaLocked(muts []netmap.NodeMutation) (hand
 
 // setExitNodeID updates prefs to reference an exit node by ID, rather
 // than by IP. It returns whether prefs was mutated.
-func setExitNodeID(prefs *ipn.Prefs, nm *netmap.NetworkMap) (prefsChanged bool) {
+func setExitNodeID(prefs *ipn.Prefs, nm *netmap.NetworkMap, lastSuggestedExitNode tailcfg.StableNodeID) (prefsChanged bool) {
 	if exitNodeIDStr, _ := syspolicy.GetString(syspolicy.ExitNodeID, ""); exitNodeIDStr != "" {
 		exitNodeID := tailcfg.StableNodeID(exitNodeIDStr)
+		if shouldAutoExitNode() && lastSuggestedExitNode != "" {
+			exitNodeID = lastSuggestedExitNode
+		}
+		// Note: when exitNodeIDStr == "auto" && lastSuggestedExitNode == "", then exitNodeID is now "auto" which will never match a peer's node ID.
+		// When there is no a peer matching the node ID, traffic will blackhole, preventing accidental non-exit-node usage when a policy is in effect that requires an exit node.
 		changed := prefs.ExitNodeID != exitNodeID || prefs.ExitNodeIP.IsValid()
 		prefs.ExitNodeID = exitNodeID
 		prefs.ExitNodeIP = netip.Addr{}
@@ -1530,10 +1746,26 @@ func endpointsEqual(x, y []tailcfg.Endpoint) bool {
 	return true
 }
 
+// SetNotifyCallback sets the function to call when the backend has something to
+// notify the frontend about. Only one callback can be set at a time, so calling
+// this function will replace the previous callback.
 func (b *LocalBackend) SetNotifyCallback(notify func(ipn.Notify)) {
+	ctx, cancel := context.WithCancel(b.ctx)
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.notify = notify
+	prevCancel := b.notifyCancel
+	b.notifyCancel = cancel
+	b.mu.Unlock()
+	if prevCancel != nil {
+		prevCancel()
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go b.WatchNotifications(ctx, 0, wg.Done, func(n *ipn.Notify) bool {
+		notify(*n)
+		return true
+	})
+	wg.Wait()
 }
 
 // SetHTTPTestClient sets an alternate HTTP client to use with
@@ -1565,6 +1797,14 @@ func (b *LocalBackend) NodeViewByIDForTest(id tailcfg.NodeID) (_ tailcfg.NodeVie
 	return n, ok
 }
 
+// DisablePortMapperForTest disables the portmapper for tests.
+// It must be called before Start.
+func (b *LocalBackend) DisablePortMapperForTest() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.portpoll = nil
+}
+
 // PeersForTest returns all the current peers, sorted by Node.ID,
 // for integration tests in another repo.
 func (b *LocalBackend) PeersForTest() []tailcfg.NodeView {
@@ -1577,9 +1817,7 @@ func (b *LocalBackend) PeersForTest() []tailcfg.NodeView {
 	return ret
 }
 
-func (b *LocalBackend) getNewControlClientFunc() clientGen {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+func (b *LocalBackend) getNewControlClientFuncLocked() clientGen {
 	if b.ccGen == nil {
 		// Initialize it rather than just returning the
 		// default to make any future call to
@@ -1589,31 +1827,6 @@ func (b *LocalBackend) getNewControlClientFunc() clientGen {
 		}
 	}
 	return b.ccGen
-}
-
-// startIsNoopLocked reports whether a Start call on this LocalBackend
-// with the provided Start Options would be a useless no-op.
-//
-// TODO(apenwarr): we shouldn't need this. The state machine is now
-// nearly clean enough where it can accept a new connection while in
-// any state, not just Running, and on any platform.  We'd want to add
-// a few more tests to state_test.go to ensure this continues to work
-// as expected.
-//
-// b.mu must be held.
-func (b *LocalBackend) startIsNoopLocked(opts ipn.Options) bool {
-	// Options has 5 fields; check all of them:
-	//   * FrontendLogID
-	//   * StateKey
-	//   * Prefs
-	//   * UpdatePrefs
-	//   * AuthKey
-	return b.state == ipn.Running &&
-		b.hostinfo != nil &&
-		b.hostinfo.FrontendLogID == opts.FrontendLogID &&
-		opts.LegacyMigrationPrefs == nil &&
-		opts.UpdatePrefs == nil &&
-		opts.AuthKey == ""
 }
 
 // Start applies the configuration specified in opts, and starts the
@@ -1627,30 +1840,22 @@ func (b *LocalBackend) startIsNoopLocked(opts ipn.Options) bool {
 // actually a supported operation (it should be, but it's very unclear
 // from the following whether or not that is a safe transition).
 func (b *LocalBackend) Start(opts ipn.Options) error {
-	if opts.LegacyMigrationPrefs != nil {
-		b.logf("Start: %v", opts.LegacyMigrationPrefs.Pretty())
-	} else {
-		b.logf("Start")
-	}
+	b.logf("Start")
 
-	b.mu.Lock()
-	if opts.LegacyMigrationPrefs == nil && !b.pm.CurrentPrefs().Valid() {
-		b.mu.Unlock()
-		return errors.New("no prefs provided")
-	}
+	var clientToShutdown controlclient.Client
+	defer func() {
+		if clientToShutdown != nil {
+			clientToShutdown.Shutdown()
+		}
+	}()
+	unlock := b.lockAndGetUnlock()
+	defer unlock()
 
 	if opts.UpdatePrefs != nil {
 		if err := b.checkPrefsLocked(opts.UpdatePrefs); err != nil {
-			b.mu.Unlock()
-			return err
-		}
-	} else if opts.LegacyMigrationPrefs != nil {
-		if err := b.checkPrefsLocked(opts.LegacyMigrationPrefs); err != nil {
-			b.mu.Unlock()
 			return err
 		}
 	}
-	profileID := b.pm.CurrentProfile().ID
 	if b.state != ipn.Running && b.conf != nil && b.conf.Parsed.AuthKey != nil && opts.AuthKey == "" {
 		v := *b.conf.Parsed.AuthKey
 		if filename, ok := strings.CutPrefix(v, "file:"); ok {
@@ -1661,26 +1866,6 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 			v = strings.TrimSpace(string(b))
 		}
 		opts.AuthKey = v
-	}
-
-	// The iOS client sends a "Start" whenever its UI screen comes
-	// up, just because it wants a netmap. That should be fixed,
-	// but meanwhile we can make Start cheaper here for such a
-	// case and not restart the world (which takes a few seconds).
-	// Instead, just send a notify with the state that iOS needs.
-	if b.startIsNoopLocked(opts) && profileID == b.lastProfileID && profileID != "" {
-		b.logf("Start: already running; sending notify")
-		nm := b.netMap
-		state := b.state
-		p := b.pm.CurrentPrefs()
-		b.mu.Unlock()
-		b.send(ipn.Notify{
-			State:         &state,
-			NetMap:        nm,
-			Prefs:         &p,
-			LoginFinished: new(empty.Message),
-		})
-		return nil
 	}
 
 	hostinfo := hostinfo.New()
@@ -1699,7 +1884,7 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 	// into sync with the minimal changes. But that's not how it
 	// is right now, which is a sign that the code is still too
 	// complicated.
-	prevCC := b.resetControlClientLocked()
+	clientToShutdown = b.resetControlClientLocked()
 	httpTestClient := b.httpTestClient
 
 	if b.hostinfo != nil {
@@ -1707,11 +1892,6 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 	}
 	b.hostinfo = hostinfo
 	b.state = ipn.NoState
-
-	if err := b.migrateStateLocked(opts.LegacyMigrationPrefs); err != nil {
-		b.mu.Unlock()
-		return fmt.Errorf("loading requested state: %v", err)
-	}
 
 	if opts.UpdatePrefs != nil {
 		oldPrefs := b.pm.CurrentPrefs()
@@ -1725,13 +1905,14 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 			b.logf("failed to save UpdatePrefs state: %v", err)
 		}
 		b.setAtomicValuesFromPrefsLocked(pv)
+	} else {
+		b.setAtomicValuesFromPrefsLocked(b.pm.CurrentPrefs())
 	}
 
 	prefs := b.pm.CurrentPrefs()
 	wantRunning := prefs.WantRunning()
 	if wantRunning {
 		if err := b.initMachineKeyLocked(); err != nil {
-			b.mu.Unlock()
 			return fmt.Errorf("initMachineKeyLocked: %w", err)
 		}
 	}
@@ -1750,7 +1931,6 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 		persistv = new(persist.Persist)
 	}
 	b.updateFilterLocked(nil, ipn.PrefsView{})
-	b.mu.Unlock()
 
 	if b.portpoll != nil {
 		b.portpollOnce.Do(func() {
@@ -1782,15 +1962,11 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 		debugFlags = append([]string{"netstack"}, debugFlags...)
 	}
 
-	if prevCC != nil {
-		prevCC.Shutdown()
-	}
-
 	// TODO(apenwarr): The only way to change the ServerURL is to
-	// re-run b.Start(), because this is the only place we create a
-	// new controlclient. SetPrefs() allows you to overwrite ServerURL,
-	// but it won't take effect until the next Start().
-	cc, err := b.getNewControlClientFunc()(controlclient.Options{
+	// re-run b.Start, because this is the only place we create a
+	// new controlclient. EditPrefs allows you to overwrite ServerURL,
+	// but it won't take effect until the next Start.
+	cc, err := b.getNewControlClientFuncLocked()(controlclient.Options{
 		GetMachinePrivateKey:       b.createGetMachinePrivateKeyFunc(),
 		Logf:                       logger.WithPrefix(b.logf, "control: "),
 		Persist:                    *persistv,
@@ -1800,7 +1976,7 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 		HTTPTestClient:             httpTestClient,
 		DiscoPublicKey:             discoPublic,
 		DebugFlags:                 debugFlags,
-		NetMon:                     b.sys.NetMon.Get(),
+		HealthTracker:              b.health,
 		Pinger:                     b,
 		PopBrowserURL:              b.tellClientToBrowseToURL,
 		OnClientVersion:            b.onClientVersion,
@@ -1820,16 +1996,7 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 		return err
 	}
 
-	b.mu.Lock()
-	// Even though we reset b.cc above, we might have raced with
-	// another Start() call. If so, shut down the previous one again
-	// as we do not know if it was created with the same options.
-	prevCC = b.resetControlClientLocked()
-	if prevCC != nil {
-		defer prevCC.Shutdown() // must be called after b.mu is unlocked
-	}
-	b.cc = cc
-	b.ccAuto, _ = cc.(*controlclient.Auto)
+	b.setControlClientLocked(cc)
 	endpoints := b.endpoints
 
 	if err := b.initTKALocked(); err != nil {
@@ -1839,37 +2006,46 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 	if b.tka != nil {
 		head, err := b.tka.authority.Head().MarshalText()
 		if err != nil {
-			b.mu.Unlock()
 			return fmt.Errorf("marshalling tka head: %w", err)
 		}
 		tkaHead = string(head)
 	}
 	confWantRunning := b.conf != nil && wantRunning
-	b.mu.Unlock()
 
 	if endpoints != nil {
 		cc.UpdateEndpoints(endpoints)
 	}
 	cc.SetTKAHead(tkaHead)
 
-	b.MagicConn().SetNetInfoCallback(b.setNetInfo)
-
 	blid := b.backendLogID.String()
 	b.logf("Backend: logs: be:%v fe:%v", blid, opts.FrontendLogID)
-	b.send(ipn.Notify{BackendLogID: &blid})
-	b.send(ipn.Notify{Prefs: &prefs})
+	b.sendLocked(ipn.Notify{
+		BackendLogID: &blid,
+		Prefs:        &prefs,
+	})
 
-	if !loggedOut && (b.hasNodeKey() || confWantRunning) {
-		// Even if !WantRunning, we should verify our key, if there
-		// is one. If you want tailscaled to be completely idle,
-		// use logout instead.
-		cc.Login(nil, controlclient.LoginDefault)
+	if !loggedOut && (b.hasNodeKeyLocked() || confWantRunning) {
+		// If we know that we're either logged in or meant to be
+		// running, tell the controlclient that it should also assume
+		// that we need to be logged in.
+		//
+		// Without this, the state machine transitions to "NeedsLogin" implying
+		// that user interaction is required, which is not the case and can
+		// regress tsnet.Server restarts.
+		cc.Login(controlclient.LoginDefault)
 	}
-	b.stateMachine()
+	b.stateMachineLockedOnEntry(unlock)
+
 	return nil
 }
 
-var warnInvalidUnsignedNodes = health.NewWarnable()
+// invalidPacketFilterWarnable is a Warnable to warn the user that the control server sent an invalid packet filter.
+var invalidPacketFilterWarnable = health.Register(&health.Warnable{
+	Code:     "invalid-packet-filter",
+	Title:    "Invalid packet filter",
+	Severity: health.SeverityHigh,
+	Text:     health.StaticMessage("The coordination server sent an invalid packet filter permitting traffic to unlocked nodes; rejecting all packets for safety"),
+})
 
 // updateFilterLocked updates the packet filter in wgengine based on the
 // given netMap and user preferences.
@@ -1901,16 +2077,15 @@ func (b *LocalBackend) updateFilterLocked(netMap *netmap.NetworkMap, prefs ipn.P
 		packetFilter = netMap.PacketFilter
 
 		if packetFilterPermitsUnlockedNodes(b.peers, packetFilter) {
-			err := errors.New("server sent invalid packet filter permitting traffic to unlocked nodes; rejecting all packets for safety")
-			warnInvalidUnsignedNodes.Set(err)
+			b.health.SetUnhealthy(invalidPacketFilterWarnable, nil)
 			packetFilter = nil
 		} else {
-			warnInvalidUnsignedNodes.Set(nil)
+			b.health.SetHealthy(invalidPacketFilterWarnable)
 		}
 	}
 	if prefs.Valid() {
 		ar := prefs.AdvertiseRoutes()
-		for i := 0; i < ar.Len(); i++ {
+		for i := range ar.Len() {
 			r := ar.At(i)
 			if r.Bits() == 0 {
 				// When offering a default route to the world, we
@@ -1973,7 +2148,9 @@ func (b *LocalBackend) updateFilterLocked(netMap *netmap.NetworkMap, prefs ipn.P
 
 	if !haveNetmap {
 		b.logf("[v1] netmap packet filter: (not ready yet)")
-		b.setFilter(filter.NewAllowNone(b.logf, logNets))
+		noneFilter := filter.NewAllowNone(b.logf, logNets)
+		b.setFilter(noneFilter)
+		b.e.SetJailedFilter(noneFilter)
 		return
 	}
 
@@ -1983,12 +2160,131 @@ func (b *LocalBackend) updateFilterLocked(netMap *netmap.NetworkMap, prefs ipn.P
 		b.setFilter(filter.NewShieldsUpFilter(localNets, logNets, oldFilter, b.logf))
 	} else {
 		b.logf("[v1] netmap packet filter: %v filters", len(packetFilter))
-		b.setFilter(filter.New(packetFilter, localNets, logNets, oldFilter, b.logf))
+		b.setFilter(filter.New(packetFilter, b.srcIPHasCapForFilter, localNets, logNets, oldFilter, b.logf))
 	}
+	// The filter for a jailed node is the exact same as a ShieldsUp filter.
+	oldJailedFilter := b.e.GetJailedFilter()
+	b.e.SetJailedFilter(filter.NewShieldsUpFilter(localNets, logNets, oldJailedFilter, b.logf))
 
 	if b.sshServer != nil {
 		go b.sshServer.OnPolicyChange()
 	}
+}
+
+// captivePortalWarnable is a Warnable which is set to an unhealthy state when a captive portal is detected.
+var captivePortalWarnable = health.Register(&health.Warnable{
+	Code:  "captive-portal-detected",
+	Title: "Captive portal detected",
+	// High severity, because captive portals block all traffic and require user intervention.
+	Severity:            health.SeverityHigh,
+	Text:                health.StaticMessage("This network requires you to log in using your web browser."),
+	ImpactsConnectivity: true,
+})
+
+func (b *LocalBackend) checkCaptivePortalLoop(ctx context.Context) {
+	var tmr *time.Timer
+
+	maybeStartTimer := func() {
+		// If there's an existing timer, nothing to do; just continue
+		// waiting for it to expire. Otherwise, create a new timer.
+		if tmr == nil {
+			tmr = time.NewTimer(captivePortalDetectionInterval)
+		}
+	}
+	maybeStopTimer := func() {
+		if tmr == nil {
+			return
+		}
+		if !tmr.Stop() {
+			<-tmr.C
+		}
+		tmr = nil
+	}
+
+	for {
+		if ctx.Err() != nil {
+			maybeStopTimer()
+			return
+		}
+
+		// First, see if we have a signal on our "healthy" channel, which
+		// takes priority over an existing timer. Because a select is
+		// nondeterministic, we explicitly check this channel before
+		// entering the main select below, so that we're guaranteed to
+		// stop the timer before starting captive portal detection.
+		select {
+		case needsCaptiveDetection := <-b.needsCaptiveDetection:
+			if needsCaptiveDetection {
+				maybeStartTimer()
+			} else {
+				maybeStopTimer()
+			}
+		default:
+		}
+
+		var timerChan <-chan time.Time
+		if tmr != nil {
+			timerChan = tmr.C
+		}
+		select {
+		case <-ctx.Done():
+			// All done; stop the timer and then exit.
+			maybeStopTimer()
+			return
+		case <-timerChan:
+			// Kick off captive portal check
+			b.performCaptiveDetection()
+			// nil out timer to force recreation
+			tmr = nil
+		case needsCaptiveDetection := <-b.needsCaptiveDetection:
+			if needsCaptiveDetection {
+				maybeStartTimer()
+			} else {
+				// Healthy; cancel any existing timer
+				maybeStopTimer()
+			}
+		}
+	}
+}
+
+// performCaptiveDetection checks if captive portal detection is enabled via controlknob. If so, it runs
+// the detection and updates the Warnable accordingly.
+func (b *LocalBackend) performCaptiveDetection() {
+	if !b.shouldRunCaptivePortalDetection() {
+		return
+	}
+
+	d := captivedetection.NewDetector(b.logf)
+	var dm *tailcfg.DERPMap
+	b.mu.Lock()
+	if b.netMap != nil {
+		dm = b.netMap.DERPMap
+	}
+	preferredDERP := 0
+	if b.hostinfo != nil {
+		if b.hostinfo.NetInfo != nil {
+			preferredDERP = b.hostinfo.NetInfo.PreferredDERP
+		}
+	}
+	ctx := b.ctx
+	netMon := b.NetMon()
+	b.mu.Unlock()
+	found := d.Detect(ctx, netMon, dm, preferredDERP)
+	if found {
+		b.health.SetUnhealthy(captivePortalWarnable, health.Args{})
+	} else {
+		b.health.SetHealthy(captivePortalWarnable)
+	}
+}
+
+// shouldRunCaptivePortalDetection reports whether captive portal detection
+// should be run. It is enabled by default, but can be disabled via a control
+// knob. It is also only run when the user explicitly wants the backend to be
+// running.
+func (b *LocalBackend) shouldRunCaptivePortalDetection() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return !b.ControlKnobs().DisableCaptivePortalDetection.Load() && b.pm.prefs.WantRunning()
 }
 
 // packetFilterPermitsUnlockedNodes reports any peer in peers with the
@@ -2062,18 +2358,18 @@ var removeFromDefaultRoute = []netip.Prefix{
 // Given that "internal" routes don't leave the device, we choose to
 // trust them more, allowing access to them when an Exit Node is enabled.
 func internalAndExternalInterfaces() (internal, external []netip.Prefix, err error) {
-	il, err := interfaces.GetList()
+	il, err := netmon.GetInterfaceList()
 	if err != nil {
 		return nil, nil, err
 	}
 	return internalAndExternalInterfacesFrom(il, runtime.GOOS)
 }
 
-func internalAndExternalInterfacesFrom(il interfaces.List, goos string) (internal, external []netip.Prefix, err error) {
+func internalAndExternalInterfacesFrom(il netmon.InterfaceList, goos string) (internal, external []netip.Prefix, err error) {
 	// We use an IPSetBuilder here to canonicalize the prefixes
 	// and to remove any duplicate entries.
 	var internalBuilder, externalBuilder netipx.IPSetBuilder
-	if err := il.ForeachInterfaceAddress(func(iface interfaces.Interface, pfx netip.Prefix) {
+	if err := il.ForeachInterfaceAddress(func(iface netmon.Interface, pfx netip.Prefix) {
 		if tsaddr.IsTailscaleIP(pfx.Addr()) {
 			return
 		}
@@ -2117,7 +2413,7 @@ func internalAndExternalInterfacesFrom(il interfaces.List, goos string) (interna
 
 func interfaceRoutes() (ips *netipx.IPSet, hostIPs []netip.Addr, err error) {
 	var b netipx.IPSetBuilder
-	if err := interfaces.ForeachInterfaceAddress(func(_ interfaces.Interface, pfx netip.Prefix) {
+	if err := netmon.ForeachInterfaceAddress(func(_ netmon.Interface, pfx netip.Prefix) {
 		if tsaddr.IsTailscaleIP(pfx.Addr()) {
 			return
 		}
@@ -2284,14 +2580,14 @@ func (b *LocalBackend) WatchNotifications(ctx context.Context, mask ipn.NotifyWa
 
 	b.mu.Lock()
 
-	const initialBits = ipn.NotifyInitialState | ipn.NotifyInitialPrefs | ipn.NotifyInitialNetMap | ipn.NotifyInitialTailFSShares
+	const initialBits = ipn.NotifyInitialState | ipn.NotifyInitialPrefs | ipn.NotifyInitialNetMap | ipn.NotifyInitialDriveShares
 	if mask&initialBits != 0 {
 		ini = &ipn.Notify{Version: version.Long()}
 		if mask&ipn.NotifyInitialState != 0 {
 			ini.SessionID = sessionID
 			ini.State = ptr.To(b.state)
-			if b.state == ipn.NeedsLogin {
-				ini.BrowseToURL = ptr.To(b.authURLSticky)
+			if b.state == ipn.NeedsLogin && b.authURL != "" {
+				ini.BrowseToURL = ptr.To(b.authURL)
 			}
 		}
 		if mask&ipn.NotifyInitialPrefs != 0 {
@@ -2300,8 +2596,11 @@ func (b *LocalBackend) WatchNotifications(ctx context.Context, mask ipn.NotifyWa
 		if mask&ipn.NotifyInitialNetMap != 0 {
 			ini.NetMap = b.netMap
 		}
-		if mask&ipn.NotifyInitialTailFSShares != 0 && b.tailFSSharingEnabledLocked() {
-			ini.TailFSShares = b.pm.prefs.TailFSShares()
+		if mask&ipn.NotifyInitialDriveShares != 0 && b.driveSharingEnabledLocked() {
+			ini.DriveShares = b.pm.prefs.DriveShares()
+		}
+		if mask&ipn.NotifyInitialHealthState != 0 {
+			ini.Health = b.HealthTracker().CurrentState()
 		}
 	}
 
@@ -2345,11 +2644,27 @@ func (b *LocalBackend) WatchNotifications(ctx context.Context, mask ipn.NotifyWa
 	// TODO(marwan-at-work): streaming background logs?
 	defer b.DeleteForegroundSession(sessionID)
 
+	var lastURLPop string // to dup suppress URL popups
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case n, ok := <-ch:
+			// URLs flow into Notify.BrowseToURL via two means:
+			//    1. From MapResponse.PopBrowserURL, which already says they're dup
+			//       suppressed if identical, and that's done by the controlclient,
+			//       so this added later adds nothing.
+			//
+			//    2. From the controlclient auth routes, on register. This makes sure
+			//       we don't tell clients (mac, windows, android) to pop the same URL
+			//       multiple times.
+			if n != nil && n.BrowseToURL != nil {
+				if v := *n.BrowseToURL; v == lastURLPop {
+					n.BrowseToURL = nil
+				} else {
+					lastURLPop = v
+				}
+			}
 			if !ok || !fn(n) {
 				return
 			}
@@ -2357,7 +2672,7 @@ func (b *LocalBackend) WatchNotifications(ctx context.Context, mask ipn.NotifyWa
 	}
 }
 
-// pollRequestEngineStatus calls b.RequestEngineStatus every 2 seconds until ctx
+// pollRequestEngineStatus calls b.e.RequestStatus every 2 seconds until ctx
 // is done.
 func (b *LocalBackend) pollRequestEngineStatus(ctx context.Context) {
 	ticker, tickerChannel := b.clock.NewTicker(2 * time.Second)
@@ -2365,7 +2680,7 @@ func (b *LocalBackend) pollRequestEngineStatus(ctx context.Context) {
 	for {
 		select {
 		case <-tickerChannel:
-			b.RequestEngineStatus()
+			b.e.RequestStatus()
 		case <-ctx.Done():
 			return
 		}
@@ -2426,6 +2741,13 @@ func (b *LocalBackend) DebugPickNewDERP() error {
 //
 // b.mu must not be held.
 func (b *LocalBackend) send(n ipn.Notify) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.sendLocked(n)
+}
+
+// sendLocked is like send, but assumes b.mu is already held.
+func (b *LocalBackend) sendLocked(n ipn.Notify) {
 	if n.Prefs != nil {
 		n.Prefs = ptr.To(stripKeysFromPrefs(*n.Prefs))
 	}
@@ -2433,8 +2755,6 @@ func (b *LocalBackend) send(n ipn.Notify) {
 		n.Version = version.Long()
 	}
 
-	b.mu.Lock()
-	notifyFunc := b.notify
 	apiSrv := b.peerAPIServer
 	if mayDeref(apiSrv).taildrop.HasFilesWaiting() {
 		n.FilesWaiting = &empty.Message{}
@@ -2447,12 +2767,6 @@ func (b *LocalBackend) send(n ipn.Notify) {
 			// Drop the notification if the channel is full.
 		}
 	}
-
-	b.mu.Unlock()
-
-	if notifyFunc != nil {
-		notifyFunc(n)
-	}
 }
 
 func (b *LocalBackend) sendFileNotify() {
@@ -2462,9 +2776,8 @@ func (b *LocalBackend) sendFileNotify() {
 	for _, wakeWaiter := range b.fileWaiters {
 		wakeWaiter()
 	}
-	notifyFunc := b.notify
 	apiSrv := b.peerAPIServer
-	if notifyFunc == nil || apiSrv == nil {
+	if apiSrv == nil {
 		b.mu.Unlock()
 		return
 	}
@@ -2487,13 +2800,15 @@ func (b *LocalBackend) sendFileNotify() {
 func (b *LocalBackend) popBrowserAuthNow() {
 	b.mu.Lock()
 	url := b.authURL
-	b.interact = false
-	b.authURL = "" // but NOT clearing authURLSticky
+	expired := b.keyExpired
 	b.mu.Unlock()
 
-	b.logf("popBrowserAuthNow: url=%v", url != "")
+	b.logf("popBrowserAuthNow: url=%v, key-expired=%v, seamless-key-renewal=%v", url != "", expired, b.seamlessRenewalEnabled())
 
-	if !b.seamlessRenewalEnabled() {
+	// Deconfigure the local network data plane if:
+	// - seamless key renewal is not enabled;
+	// - key is expired (in which case tailnet connectivity is down anyway).
+	if !b.seamlessRenewalEnabled() || expired {
 		b.blockEngineUpdates(true)
 		b.stopEngineAndWait()
 	}
@@ -2548,11 +2863,15 @@ func (b *LocalBackend) tellClientToBrowseToURL(url string) {
 func (b *LocalBackend) onClientVersion(v *tailcfg.ClientVersion) {
 	b.mu.Lock()
 	b.lastClientVersion = v
+	b.health.SetLatestVersion(v)
 	b.mu.Unlock()
 	b.send(ipn.Notify{ClientVersion: v})
 }
 
 func (b *LocalBackend) onTailnetDefaultAutoUpdate(au bool) {
+	unlock := b.lockAndGetUnlock()
+	defer unlock()
+
 	prefs := b.pm.CurrentPrefs()
 	if !prefs.Valid() {
 		b.logf("[unexpected]: received tailnet default auto-update callback but current prefs are nil")
@@ -2563,15 +2882,21 @@ func (b *LocalBackend) onTailnetDefaultAutoUpdate(au bool) {
 		// user. Tailnet default should not affect us, even if it changes.
 		return
 	}
+	if au && b.hostinfo != nil && b.hostinfo.Container.EqualBool(true) {
+		// This is a containerized node, which is usually meant to be
+		// immutable. Do not enable auto-updates if the tailnet does. But users
+		// can still manually enable auto-updates on this node.
+		return
+	}
 	b.logf("using tailnet default auto-update setting: %v", au)
 	prefsClone := prefs.AsStruct()
 	prefsClone.AutoUpdate.Apply = opt.NewBool(au)
-	_, err := b.EditPrefs(&ipn.MaskedPrefs{
+	_, err := b.editPrefsLockedOnEntry(&ipn.MaskedPrefs{
 		Prefs: *prefsClone,
 		AutoUpdateSet: ipn.AutoUpdatePrefsMask{
 			ApplySet: true,
 		},
-	})
+	}, unlock)
 	if err != nil {
 		b.logf("failed to apply tailnet-wide default for auto-updates (%v): %v", au, err)
 		return
@@ -2670,30 +2995,6 @@ func (b *LocalBackend) clearMachineKeyLocked() error {
 	return nil
 }
 
-// migrateStateLocked migrates state from the frontend to the backend.
-// It is a no-op if prefs is nil
-// b.mu must be held.
-func (b *LocalBackend) migrateStateLocked(prefs *ipn.Prefs) (err error) {
-	if prefs == nil && !b.pm.CurrentPrefs().Valid() {
-		return fmt.Errorf("no prefs provided and no current profile")
-	}
-	if prefs != nil {
-		// Backend owns the state, but frontend is trying to migrate
-		// state into the backend.
-		b.logf("importing frontend prefs into backend store; frontend prefs: %s", prefs.Pretty())
-		if err := b.pm.SetPrefs(prefs.View(), ipn.NetworkProfile{
-			MagicDNSName: b.netMap.MagicDNSSuffix(),
-			DomainName:   b.netMap.DomainName(),
-		}); err != nil {
-			return fmt.Errorf("store.WriteState: %v", err)
-		}
-	}
-
-	b.setAtomicValuesFromPrefsLocked(b.pm.CurrentPrefs())
-
-	return nil
-}
-
 // setTCPPortsIntercepted populates b.shouldInterceptTCPPortAtomic with an
 // efficient func for ShouldInterceptTCPPort to use, which is called on every
 // incoming packet.
@@ -2739,13 +3040,13 @@ func (b *LocalBackend) setAtomicValuesFromPrefsLocked(p ipn.PrefsView) {
 	b.setExposeRemoteWebClientAtomicBoolLocked(p)
 
 	if !p.Valid() {
-		b.containsViaIPFuncAtomic.Store(tsaddr.FalseContainsIPFunc())
+		b.containsViaIPFuncAtomic.Store(ipset.FalseContainsIPFunc())
 		b.setTCPPortsIntercepted(nil)
 		b.lastServeConfJSON = mem.B(nil)
 		b.serveConfig = ipn.ServeConfigView{}
 	} else {
 		filtered := tsaddr.FilterPrefixesCopy(p.AdvertiseRoutes(), tsaddr.IsViaPrefix)
-		b.containsViaIPFuncAtomic.Store(tsaddr.NewContainsIPFunc(views.SliceOf(filtered)))
+		b.containsViaIPFuncAtomic.Store(ipset.NewContainsIPFunc(views.SliceOf(filtered)))
 		b.setTCPPortsInterceptedFromNetmapAndPrefsLocked(p)
 	}
 }
@@ -2823,25 +3124,15 @@ func (b *LocalBackend) tryLookupUserName(uid string) string {
 	return u.Username
 }
 
-// Login implements Backend.
-// As of 2022-11-15, this is only exists for Android.
-func (b *LocalBackend) Login(token *tailcfg.Oauth2Token) {
+// StartLoginInteractive requests a new interactive login from controlclient,
+// unless such a flow is already in progress, in which case
+// StartLoginInteractive attempts to pick up the in-progress flow where it left
+// off.
+func (b *LocalBackend) StartLoginInteractive(ctx context.Context) error {
 	b.mu.Lock()
-	b.assertClientLocked()
-	cc := b.cc
-	b.mu.Unlock()
-
-	cc.Login(token, b.loginFlags|controlclient.LoginInteractive)
-}
-
-// StartLoginInteractive implements Backend. It requests a new
-// interactive login from controlclient, unless such a flow is already
-// in progress, in which case StartLoginInteractive attempts to pick
-// up the in-progress flow where it left off.
-func (b *LocalBackend) StartLoginInteractive() {
-	b.mu.Lock()
-	b.assertClientLocked()
-	b.interact = true
+	if b.cc == nil {
+		panic("LocalBackend.assertClient: b.cc == nil")
+	}
 	url := b.authURL
 	timeSinceAuthURLCreated := b.clock.Since(b.authURLTime)
 	cc := b.cc
@@ -2854,8 +3145,9 @@ func (b *LocalBackend) StartLoginInteractive() {
 	if url != "" && timeSinceAuthURLCreated < ((7*24*time.Hour)-(1*time.Hour)) {
 		b.popBrowserAuthNow()
 	} else {
-		cc.Login(nil, b.loginFlags|controlclient.LoginInteractive)
+		cc.Login(b.loginFlags | controlclient.LoginInteractive)
 	}
+	return nil
 }
 
 func (b *LocalBackend) Ping(ctx context.Context, ip netip.Addr, pingType tailcfg.PingType, size int) (*ipnstate.PingResult, error) {
@@ -3005,20 +3297,20 @@ func (b *LocalBackend) SetCurrentUser(token ipnauth.WindowsToken) (ipn.WindowsUs
 		}
 	}
 
-	b.mu.Lock()
+	unlock := b.lockAndGetUnlock()
+	defer unlock()
+
 	if b.pm.CurrentUserID() == uid {
-		b.mu.Unlock()
 		return uid, nil
 	}
 	if err := b.pm.SetCurrentUserID(uid); err != nil {
-		b.mu.Unlock()
 		return uid, nil
 	}
 	if b.currentUser != nil {
 		b.currentUser.Close()
 	}
 	b.currentUser = token
-	b.resetForProfileChangeLockedOnEntry()
+	b.resetForProfileChangeLockedOnEntry(unlock)
 	return uid, nil
 }
 
@@ -3056,6 +3348,9 @@ func (b *LocalBackend) checkPrefsLocked(p *ipn.Prefs) error {
 		errs = append(errs, err)
 	}
 	if err := b.checkFunnelEnabledLocked(p); err != nil {
+		errs = append(errs, err)
+	}
+	if err := b.checkAutoUpdatePrefsLocked(p); err != nil {
 		errs = append(errs, err)
 	}
 	return multierr.New(errs...)
@@ -3118,20 +3413,31 @@ func (b *LocalBackend) isDefaultServerLocked() bool {
 	return prefs.ControlURLOrDefault() == ipn.DefaultControlURL
 }
 
-var warnExitNodeUsage = health.NewWarnable(health.WithConnectivityImpact())
+var exitNodeMisconfigurationWarnable = health.Register(&health.Warnable{
+	Code:     "exit-node-misconfiguration",
+	Title:    "Exit node misconfiguration",
+	Severity: health.SeverityMedium,
+	Text: func(args health.Args) string {
+		return "Exit node misconfiguration: " + args[health.ArgError]
+	},
+})
 
 // updateExitNodeUsageWarning updates a warnable meant to notify users of
 // configuration issues that could break exit node usage.
-func updateExitNodeUsageWarning(p ipn.PrefsView, state *interfaces.State) {
-	var result error
+func updateExitNodeUsageWarning(p ipn.PrefsView, state *netmon.State, healthTracker *health.Tracker) {
+	var msg string
 	if p.ExitNodeIP().IsValid() || p.ExitNodeID() != "" {
 		warn, _ := netutil.CheckReversePathFiltering(state)
 		const comment = "please set rp_filter=2 instead of rp_filter=1; see https://github.com/tailscale/tailscale/issues/3310"
 		if len(warn) > 0 {
-			result = fmt.Errorf("%s: %v, %s", healthmsg.WarnExitNodeUsage, warn, comment)
+			msg = fmt.Sprintf("%s: %v, %s", healthmsg.WarnExitNodeUsage, warn, comment)
 		}
 	}
-	warnExitNodeUsage.Set(result)
+	if len(msg) > 0 {
+		healthTracker.SetUnhealthy(exitNodeMisconfigurationWarnable, health.Args{health.ArgError: msg})
+	} else {
+		healthTracker.SetHealthy(exitNodeMisconfigurationWarnable)
+	}
 }
 
 func (b *LocalBackend) checkExitNodePrefsLocked(p *ipn.Prefs) error {
@@ -3148,8 +3454,87 @@ func (b *LocalBackend) checkFunnelEnabledLocked(p *ipn.Prefs) error {
 	return nil
 }
 
+func (b *LocalBackend) checkAutoUpdatePrefsLocked(p *ipn.Prefs) error {
+	if p.AutoUpdate.Apply.EqualBool(true) && !clientupdate.CanAutoUpdate() {
+		return errors.New("Auto-updates are not supported on this platform.")
+	}
+	return nil
+}
+
+// SetUseExitNodeEnabled turns on or off the most recently selected exit node.
+//
+// On success, it returns the resulting prefs (or current prefs, in the case of no change).
+// Setting the value to false when use of an exit node is already false is not an error,
+// nor is true when the exit node is already in use.
+func (b *LocalBackend) SetUseExitNodeEnabled(v bool) (ipn.PrefsView, error) {
+	unlock := b.lockAndGetUnlock()
+	defer unlock()
+
+	p0 := b.pm.CurrentPrefs()
+	if v && p0.ExitNodeID() != "" {
+		// Already on.
+		return p0, nil
+	}
+	if !v && p0.ExitNodeID() == "" {
+		// Already off.
+		return p0, nil
+	}
+
+	var zero ipn.PrefsView
+	if v && p0.InternalExitNodePrior() == "" {
+		if !p0.ExitNodeIP().IsValid() {
+			return zero, errors.New("no exit node IP to enable & prior exit node IP was never resolved an a node")
+		}
+		return zero, errors.New("no prior exit node to enable")
+	}
+
+	mp := &ipn.MaskedPrefs{}
+	if v {
+		mp.ExitNodeIDSet = true
+		mp.ExitNodeID = tailcfg.StableNodeID(p0.InternalExitNodePrior())
+	} else {
+		mp.ExitNodeIDSet = true
+		mp.ExitNodeID = ""
+		mp.InternalExitNodePriorSet = true
+		mp.InternalExitNodePrior = p0.ExitNodeID()
+	}
+	return b.editPrefsLockedOnEntry(mp, unlock)
+}
+
+// MaybeClearAppConnector clears the routes from any AppConnector if
+// AdvertiseRoutes has been set in the MaskedPrefs.
+func (b *LocalBackend) MaybeClearAppConnector(mp *ipn.MaskedPrefs) error {
+	var err error
+	if b.appConnector != nil && mp.AdvertiseRoutesSet {
+		err = b.appConnector.ClearRoutes()
+		if err != nil {
+			b.logf("appc: clear routes error: %v", err)
+		}
+	}
+	return err
+}
+
 func (b *LocalBackend) EditPrefs(mp *ipn.MaskedPrefs) (ipn.PrefsView, error) {
-	b.mu.Lock()
+	if mp.SetsInternal() {
+		return ipn.PrefsView{}, errors.New("can't set Internal fields")
+	}
+
+	// Zeroing the ExitNodeId via localAPI must also zero the prior exit node.
+	if mp.ExitNodeIDSet && mp.ExitNodeID == "" {
+		mp.InternalExitNodePrior = ""
+		mp.InternalExitNodePriorSet = true
+	}
+
+	unlock := b.lockAndGetUnlock()
+	defer unlock()
+	return b.editPrefsLockedOnEntry(mp, unlock)
+}
+
+// Warning: b.mu must be held on entry, but it unlocks it on the way out.
+// TODO(bradfitz): redo the locking on all these weird methods like this.
+func (b *LocalBackend) editPrefsLockedOnEntry(mp *ipn.MaskedPrefs, unlock unlockOnce) (ipn.PrefsView, error) {
+	defer unlock() // for error paths
+
 	if mp.EggSet {
 		mp.EggSet = false
 		b.egg = true
@@ -3159,21 +3544,18 @@ func (b *LocalBackend) EditPrefs(mp *ipn.MaskedPrefs) (ipn.PrefsView, error) {
 	p1 := b.pm.CurrentPrefs().AsStruct()
 	p1.ApplyEdits(mp)
 	if err := b.checkPrefsLocked(p1); err != nil {
-		b.mu.Unlock()
 		b.logf("EditPrefs check error: %v", err)
 		return ipn.PrefsView{}, err
 	}
 	if p1.RunSSH && !envknob.CanSSHD() {
-		b.mu.Unlock()
 		b.logf("EditPrefs requests SSH, but disabled by envknob; returning error")
 		return ipn.PrefsView{}, errors.New("Tailscale SSH server administratively disabled.")
 	}
 	if p1.View().Equals(p0) {
-		b.mu.Unlock()
 		return stripKeysFromPrefs(p0), nil
 	}
 	b.logf("EditPrefs: %v", mp.Pretty())
-	newPrefs := b.setPrefsLockedOnEntry("EditPrefs", p1) // does a b.mu.Unlock
+	newPrefs := b.setPrefsLockedOnEntry(p1, unlock)
 
 	// Note: don't perform any actions for the new prefs here. Not
 	// every prefs change goes through EditPrefs. Put your actions
@@ -3200,16 +3582,6 @@ func (b *LocalBackend) checkProfileNameLocked(p *ipn.Prefs) error {
 	return nil
 }
 
-// SetPrefs saves new user preferences and propagates them throughout
-// the system. Implements Backend.
-func (b *LocalBackend) SetPrefs(newp *ipn.Prefs) {
-	if newp == nil {
-		panic("SetPrefs got nil prefs")
-	}
-	b.mu.Lock()
-	b.setPrefsLockedOnEntry("SetPrefs", newp)
-}
-
 // wantIngressLocked reports whether this node has ingress configured. This bool
 // is sent to the coordination server (in Hostinfo.WireIngress) as an
 // optimization hint to know primarily which nodes are NOT using ingress, to
@@ -3227,7 +3599,9 @@ func (b *LocalBackend) wantIngressLocked() bool {
 // setPrefsLockedOnEntry requires b.mu be held to call it, but it
 // unlocks b.mu when done. newp ownership passes to this function.
 // It returns a readonly copy of the new prefs.
-func (b *LocalBackend) setPrefsLockedOnEntry(caller string, newp *ipn.Prefs) ipn.PrefsView {
+func (b *LocalBackend) setPrefsLockedOnEntry(newp *ipn.Prefs, unlock unlockOnce) ipn.PrefsView {
+	defer unlock()
+
 	netMap := b.netMap
 	b.setAtomicValuesFromPrefsLocked(newp.View())
 
@@ -3238,7 +3612,7 @@ func (b *LocalBackend) setPrefsLockedOnEntry(caller string, newp *ipn.Prefs) ipn
 	// setExitNodeID returns whether it updated b.prefs, but
 	// everything in this function treats b.prefs as completely new
 	// anyway. No-op if no exit node resolution is needed.
-	setExitNodeID(newp, netMap)
+	setExitNodeID(newp, netMap, b.lastSuggestedExitNode)
 	// applySysPolicy does likewise so we can also ignore its return value.
 	applySysPolicy(newp)
 	// We do this to avoid holding the lock while doing everything else.
@@ -3253,10 +3627,6 @@ func (b *LocalBackend) setPrefsLockedOnEntry(caller string, newp *ipn.Prefs) ipn
 	hostInfoChanged := !oldHi.Equal(newHi)
 	cc := b.cc
 
-	// [GRINDER STATS LINE] - please don't remove (used for log parsing)
-	if caller == "SetPrefs" {
-		b.logf("SetPrefs: %v", newp.Pretty())
-	}
 	b.updateFilterLocked(netMap, newp.View())
 
 	if oldp.ShouldSSHBeRunning() && !newp.ShouldSSHBeRunning() {
@@ -3287,8 +3657,16 @@ func (b *LocalBackend) setPrefsLockedOnEntry(caller string, newp *ipn.Prefs) ipn
 	}); err != nil {
 		b.logf("failed to save new controlclient state: %v", err)
 	}
-	b.lastProfileID = b.pm.CurrentProfile().ID
-	b.mu.Unlock()
+
+	if newp.AutoUpdate.Apply.EqualBool(true) {
+		if b.state != ipn.Running {
+			b.maybeStartOfflineAutoUpdate(newp.View())
+		}
+	} else {
+		b.stopOfflineAutoUpdate()
+	}
+
+	unlock.UnlockEarly()
 
 	if oldp.ShieldsUp() != newp.ShieldsUp || hostInfoChanged {
 		b.doSetHostinfoFilterServices()
@@ -3300,7 +3678,7 @@ func (b *LocalBackend) setPrefsLockedOnEntry(caller string, newp *ipn.Prefs) ipn
 
 	if !oldp.WantRunning() && newp.WantRunning {
 		b.logf("transitioning to running; doing Login...")
-		cc.Login(nil, controlclient.LoginDefault)
+		cc.Login(controlclient.LoginDefault)
 	}
 
 	if oldp.WantRunning() != newp.WantRunning {
@@ -3374,8 +3752,8 @@ func (b *LocalBackend) TCPHandlerForDst(src, dst netip.AddrPort) (handler func(c
 				return b.handleWebClientConn, opts
 			}
 			return b.HandleQuad100Port80Conn, opts
-		case TailFSLocalPort:
-			return b.handleTailFSConn, opts
+		case DriveLocalPort:
+			return b.handleDriveConn, opts
 		}
 	}
 
@@ -3409,9 +3787,9 @@ func (b *LocalBackend) TCPHandlerForDst(src, dst netip.AddrPort) (handler func(c
 	return nil, nil
 }
 
-func (b *LocalBackend) handleTailFSConn(conn net.Conn) error {
-	fs, ok := b.sys.TailFSForLocal.GetOK()
-	if !ok || !b.TailFSAccessEnabled() {
+func (b *LocalBackend) handleDriveConn(conn net.Conn) error {
+	fs, ok := b.sys.DriveForLocal.GetOK()
+	if !ok || !b.DriveAccessEnabled() {
 		conn.Close()
 		return nil
 	}
@@ -3447,15 +3825,15 @@ func (b *LocalBackend) peerAPIServicesLocked() (ret []tailcfg.Service) {
 // TODO(danderson): we shouldn't be mangling hostinfo here after
 // painstakingly constructing it in twelvety other places.
 func (b *LocalBackend) doSetHostinfoFilterServices() {
-	b.mu.Lock()
+	unlock := b.lockAndGetUnlock()
+	defer unlock()
+
 	cc := b.cc
 	if cc == nil {
 		// Control client isn't up yet.
-		b.mu.Unlock()
 		return
 	}
 	if b.hostinfo == nil {
-		b.mu.Unlock()
 		b.logf("[unexpected] doSetHostinfoFilterServices with nil hostinfo")
 		return
 	}
@@ -3466,7 +3844,7 @@ func (b *LocalBackend) doSetHostinfoFilterServices() {
 
 	// TODO(maisem,bradfitz): store hostinfo as a view, not as a mutable struct.
 	hi := *b.hostinfo // shallow copy
-	b.mu.Unlock()
+	unlock.UnlockEarly()
 
 	// Make a shallow copy of hostinfo so we can mutate
 	// at the Service field.
@@ -3522,8 +3900,22 @@ func (b *LocalBackend) reconfigAppConnectorLocked(nm *netmap.NetworkMap, prefs i
 		return
 	}
 
-	if b.appConnector == nil {
-		b.appConnector = appc.NewAppConnector(b.logf, b)
+	shouldAppCStoreRoutes := b.ControlKnobs().AppCStoreRoutes.Load()
+	if b.appConnector == nil || b.appConnector.ShouldStoreRoutes() != shouldAppCStoreRoutes {
+		var ri *appc.RouteInfo
+		var storeFunc func(*appc.RouteInfo) error
+		if shouldAppCStoreRoutes {
+			var err error
+			ri, err = b.readRouteInfoLocked()
+			if err != nil {
+				ri = &appc.RouteInfo{}
+				if err != ipn.ErrStateNotExist {
+					b.logf("Unsuccessful Read RouteInfo: ", err)
+				}
+			}
+			storeFunc = b.storeRouteInfo
+		}
+		b.appConnector = appc.NewAppConnector(b.logf, b, ri, storeFunc)
 	}
 	if nm == nil {
 		return
@@ -3572,6 +3964,7 @@ func (b *LocalBackend) authReconfig() {
 	nm := b.netMap
 	hasPAC := b.prevIfState.HasPAC()
 	disableSubnetsIfPAC := nm.HasCap(tailcfg.NodeAttrDisableSubnetsIfPAC)
+	userDialUseRoutes := nm.HasCap(tailcfg.NodeAttrUserDialUseRoutes)
 	dohURL, dohURLOK := exitNodeCanProxyDNS(nm, b.peers, prefs.ExitNodeID())
 	dcfg := dnsConfigForNetmap(nm, b.peers, prefs, b.logf, version.OS())
 	// If the current node is an app connector, ensure the app connector machine is started
@@ -3594,9 +3987,6 @@ func (b *LocalBackend) authReconfig() {
 	var flags netmap.WGConfigFlags
 	if prefs.RouteAll() {
 		flags |= netmap.AllowSubnetRoutes
-	}
-	if prefs.AllowSingleHosts() {
-		flags |= netmap.AllowSingleHosts
 	}
 	if hasPAC && disableSubnetsIfPAC {
 		if flags&netmap.AllowSubnetRoutes != 0 {
@@ -3629,6 +4019,12 @@ func (b *LocalBackend) authReconfig() {
 	}
 	b.logf("[v1] authReconfig: ra=%v dns=%v 0x%02x: %v", prefs.RouteAll(), prefs.CorpDNS(), flags, err)
 
+	if userDialUseRoutes {
+		b.dialer.SetRoutes(rcfg.Routes, rcfg.LocalRoutes)
+	} else {
+		b.dialer.SetRoutes(nil, nil)
+	}
+
 	b.initPeerAPIListener()
 }
 
@@ -3652,7 +4048,7 @@ func shouldUseOneCGNATRoute(logf logger.Logf, controlKnobs *controlknobs.Knobs, 
 	// use fine-grained routes if another interfaces is also using the CGNAT
 	// IP range.
 	if versionOS == "macOS" {
-		hasCGNATInterface, err := interfaces.HasCGNATInterface()
+		hasCGNATInterface, err := netmon.HasCGNATInterface()
 		if err != nil {
 			logf("shouldUseOneCGNATRoute: Could not determine if any interfaces use CGNAT: %v", err)
 			return false
@@ -3680,8 +4076,8 @@ func dnsConfigForNetmap(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg.
 	}
 
 	// selfV6Only is whether we only have IPv6 addresses ourselves.
-	selfV6Only := views.SliceContainsFunc(nm.GetAddresses(), tsaddr.PrefixIs6) &&
-		!views.SliceContainsFunc(nm.GetAddresses(), tsaddr.PrefixIs4)
+	selfV6Only := nm.GetAddresses().ContainsFunc(tsaddr.PrefixIs6) &&
+		!nm.GetAddresses().ContainsFunc(tsaddr.PrefixIs4)
 	dcfg.OnlyIPv6 = selfV6Only
 
 	// Populate MagicDNS records. We do this unconditionally so that
@@ -4128,13 +4524,22 @@ func (b *LocalBackend) routerConfig(cfg *wgcfg.Config, prefs ipn.PrefsView, oneC
 		netfilterKind = prefs.NetfilterKind()
 	}
 
+	var doStatefulFiltering bool
+	if v, ok := prefs.NoStatefulFiltering().Get(); ok && !v {
+		// The preferences explicitly "do stateful filtering" is turned
+		// off, or to expand the double negative, to do stateful
+		// filtering. Do so.
+		doStatefulFiltering = true
+	}
+
 	rs := &router.Config{
-		LocalAddrs:       unmapIPPrefixes(cfg.Addresses),
-		SubnetRoutes:     unmapIPPrefixes(prefs.AdvertiseRoutes().AsSlice()),
-		SNATSubnetRoutes: !prefs.NoSNAT(),
-		NetfilterMode:    prefs.NetfilterMode(),
-		Routes:           peerRoutes(b.logf, cfg.Peers, singleRouteThreshold),
-		NetfilterKind:    netfilterKind,
+		LocalAddrs:        unmapIPPrefixes(cfg.Addresses),
+		SubnetRoutes:      unmapIPPrefixes(prefs.AdvertiseRoutes().AsSlice()),
+		SNATSubnetRoutes:  !prefs.NoSNAT(),
+		StatefulFiltering: doStatefulFiltering,
+		NetfilterMode:     prefs.NetfilterMode(),
+		Routes:            peerRoutes(b.logf, cfg.Peers, singleRouteThreshold),
+		NetfilterKind:     netfilterKind,
 	}
 
 	if distro.Get() == distro.Synology {
@@ -4172,7 +4577,7 @@ func (b *LocalBackend) routerConfig(cfg *wgcfg.Config, prefs ipn.PrefsView, oneC
 			b.logf("failed to discover interface ips: %v", err)
 		}
 		switch runtime.GOOS {
-		case "linux", "windows", "darwin", "ios":
+		case "linux", "windows", "darwin", "ios", "android":
 			rs.LocalRoutes = internalIPs // unconditionally allow access to guest VM networks
 			if prefs.ExitNodeAllowLANAccess() {
 				rs.LocalRoutes = append(rs.LocalRoutes, externalIPs...)
@@ -4250,33 +4655,66 @@ func (b *LocalBackend) applyPrefsToHostinfoLocked(hi *tailcfg.Hostinfo, prefs ip
 // really this is more "one of several places in which random things
 // happen".
 func (b *LocalBackend) enterState(newState ipn.State) {
-	b.mu.Lock()
-	b.enterStateLockedOnEntry(newState)
+	unlock := b.lockAndGetUnlock()
+	b.enterStateLockedOnEntry(newState, unlock)
 }
 
 // enterStateLockedOnEntry is like enterState but requires b.mu be held to call
-// it, but it unlocks b.mu when done.
-func (b *LocalBackend) enterStateLockedOnEntry(newState ipn.State) {
+// it, but it unlocks b.mu when done (via unlock, a once func).
+func (b *LocalBackend) enterStateLockedOnEntry(newState ipn.State, unlock unlockOnce) {
 	oldState := b.state
 	b.state = newState
 	prefs := b.pm.CurrentPrefs()
+
+	// Some temporary (2024-05-05) debugging code to help us catch
+	// https://github.com/tailscale/tailscale/issues/11962 in the act.
+	if prefs.WantRunning() &&
+		prefs.ControlURLOrDefault() == ipn.DefaultControlURL &&
+		envknob.Bool("TS_PANIC_IF_HIT_MAIN_CONTROL") {
+		panic("[unexpected] use of main control server in integration test")
+	}
+
 	netMap := b.netMap
 	activeLogin := b.activeLogin
 	authURL := b.authURL
 	if newState == ipn.Running {
 		b.authURL = ""
-		b.authURLSticky = ""
 		b.authURLTime = time.Time{}
+
+		// Start a captive portal detection loop if none has been
+		// started. Create a new context if none is present, since it
+		// can be shut down if we transition away from Running.
+		if b.captiveCancel == nil {
+			b.captiveCtx, b.captiveCancel = context.WithCancel(b.ctx)
+			go b.checkCaptivePortalLoop(b.captiveCtx)
+		}
 	} else if oldState == ipn.Running {
 		// Transitioning away from running.
 		b.closePeerAPIListenersLocked()
+
+		// Stop any existing captive portal detection loop.
+		if b.captiveCancel != nil {
+			b.captiveCancel()
+			b.captiveCancel = nil
+
+			// NOTE: don't set captiveCtx to nil here, to ensure
+			// that we always have a (canceled) context to wait on
+			// in onHealthChange.
+		}
 	}
 	b.pauseOrResumeControlClientLocked()
-	b.mu.Unlock()
+
+	if newState == ipn.Running {
+		b.stopOfflineAutoUpdate()
+	} else {
+		b.maybeStartOfflineAutoUpdate(prefs)
+	}
+
+	unlock.UnlockEarly()
 
 	// prefs may change irrespective of state; WantRunning should be explicitly
 	// set before potential early return even if the state is unchanged.
-	health.SetIPNState(newState.String(), prefs.Valid() && prefs.WantRunning())
+	b.health.SetIPNState(newState.String(), prefs.Valid() && prefs.WantRunning())
 	if oldState == newState {
 		return
 	}
@@ -4317,14 +4755,6 @@ func (b *LocalBackend) enterStateLockedOnEntry(newState ipn.State) {
 	default:
 		b.logf("[unexpected] unknown newState %#v", newState)
 	}
-}
-
-// hasNodeKey reports whether a non-zero node key is present in the current
-// prefs.
-func (b *LocalBackend) hasNodeKey() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.hasNodeKeyLocked()
 }
 
 func (b *LocalBackend) hasNodeKeyLocked() bool {
@@ -4416,11 +4846,6 @@ func (b *LocalBackend) nextStateLocked() ipn.State {
 	}
 }
 
-// RequestEngineStatus implements Backend.
-func (b *LocalBackend) RequestEngineStatus() {
-	b.e.RequestStatus()
-}
-
 // stateMachine updates the state machine state based on other things
 // that have happened. It is invoked from the various callbacks that
 // feed events into LocalBackend.
@@ -4428,8 +4853,69 @@ func (b *LocalBackend) RequestEngineStatus() {
 // TODO(apenwarr): use a channel or something to prevent reentrancy?
 // Or maybe just call the state machine from fewer places.
 func (b *LocalBackend) stateMachine() {
+	unlock := b.lockAndGetUnlock()
+	b.stateMachineLockedOnEntry(unlock)
+}
+
+// stateMachineLockedOnEntry is like stateMachine but requires b.mu be held to
+// call it, but it unlocks b.mu when done (via unlock, a once func).
+func (b *LocalBackend) stateMachineLockedOnEntry(unlock unlockOnce) {
+	b.enterStateLockedOnEntry(b.nextStateLocked(), unlock)
+}
+
+// lockAndGetUnlock locks b.mu and returns a sync.OnceFunc function that will
+// unlock it at most once.
+//
+// This is all very unfortunate but exists as a guardrail against the
+// unfortunate "lockedOnEntry" methods in this package (primarily
+// enterStateLockedOnEntry) that require b.mu held to be locked on entry to the
+// function but unlock the mutex on their way out. As a stepping stone to
+// cleaning things up (as of 2024-04-06), we at least pass the unlock func
+// around now and defer unlock in the caller to avoid missing unlocks and double
+// unlocks. TODO(bradfitz,maisem): make the locking in this package more
+// traditional (simple). See https://github.com/tailscale/tailscale/issues/11649
+func (b *LocalBackend) lockAndGetUnlock() (unlock unlockOnce) {
 	b.mu.Lock()
-	b.enterStateLockedOnEntry(b.nextStateLocked())
+	var unlocked atomic.Bool
+	return func() bool {
+		if unlocked.CompareAndSwap(false, true) {
+			b.mu.Unlock()
+			return true
+		}
+		return false
+	}
+}
+
+// unlockOnce is a func that unlocks only b.mu the first time it's called.
+// Therefore it can be safely deferred to catch error paths, without worrying
+// about double unlocks if a different point in the code later needs to explicitly
+// unlock it first as well. It reports whether it was unlocked.
+type unlockOnce func() bool
+
+// UnlockEarly unlocks the LocalBackend.mu. It panics if u returns false,
+// indicating that this unlocker was already used.
+//
+// We're using this method to help us document & find the places that have
+// atypical locking patterns. See
+// https://github.com/tailscale/tailscale/issues/11649 for background.
+//
+// A normal unlock is a deferred one or an explicit b.mu.Unlock a few lines
+// after the lock, without lots of control flow in-between. An "early" unlock is
+// one that happens in weird places, like in various "LockedOnEntry" methods in
+// this package that require the mutex to be locked on entry but unlock it
+// somewhere in the middle (maybe several calls away) and then sometimes proceed
+// to lock it again.
+//
+// The reason UnlockeEarly panics if already called is because these are the
+// points at which it's assumed that the mutex is already held and it now needs
+// to be released. If somebody already released it, that invariant was violated.
+// On the other hand, simply calling u only returns false instead of panicking
+// so you can defer it without care, confident you got all the error return
+// paths which were previously done by hand.
+func (u unlockOnce) UnlockEarly() {
+	if !u() {
+		panic("Unlock on already-called unlockOnce")
+	}
 }
 
 // stopEngineAndWait deconfigures the local network data plane, and
@@ -4450,11 +4936,21 @@ func (b *LocalBackend) requestEngineStatusAndWait() {
 	b.logf("requestEngineStatusAndWait")
 
 	b.statusLock.Lock()
+	defer b.statusLock.Unlock()
+
 	go b.e.RequestStatus()
 	b.logf("requestEngineStatusAndWait: waiting...")
 	b.statusChanged.Wait() // temporarily releases lock while waiting
 	b.logf("requestEngineStatusAndWait: got status update.")
-	b.statusLock.Unlock()
+}
+
+// setControlClientLocked sets the control client to cc,
+// which may be nil.
+//
+// b.mu must be held.
+func (b *LocalBackend) setControlClientLocked(cc controlclient.Client) {
+	b.cc = cc
+	b.ccAuto, _ = cc.(*controlclient.Auto)
 }
 
 // resetControlClientLocked sets b.cc to nil and returns the old value. If the
@@ -4464,6 +4960,8 @@ func (b *LocalBackend) resetControlClientLocked() controlclient.Client {
 	if b.cc == nil {
 		return nil
 	}
+
+	b.authURL = ""
 
 	// When we clear the control client, stop any outstanding netmap expiry
 	// timer; synthesizing a new netmap while we don't have a control
@@ -4479,8 +4977,7 @@ func (b *LocalBackend) resetControlClientLocked() controlclient.Client {
 		b.numClientStatusCalls.Add(1)
 	}
 	prev := b.cc
-	b.cc = nil
-	b.ccAuto = nil
+	b.setControlClientLocked(nil)
 	return prev
 }
 
@@ -4493,7 +4990,9 @@ func (b *LocalBackend) resetControlClientLocked() controlclient.Client {
 func (b *LocalBackend) ResetForClientDisconnect() {
 	b.logf("LocalBackend.ResetForClientDisconnect")
 
-	b.mu.Lock()
+	unlock := b.lockAndGetUnlock()
+	defer unlock()
+
 	prevCC := b.resetControlClientLocked()
 	if prevCC != nil {
 		// Needs to happen without b.mu held.
@@ -4508,11 +5007,11 @@ func (b *LocalBackend) ResetForClientDisconnect() {
 	}
 	b.keyExpired = false
 	b.authURL = ""
-	b.authURLSticky = ""
 	b.authURLTime = time.Time{}
 	b.activeLogin = ""
+	b.resetDialPlan()
 	b.setAtomicValuesFromPrefsLocked(ipn.PrefsView{})
-	b.enterStateLockedOnEntry(ipn.Stopped)
+	b.enterStateLockedOnEntry(ipn.Stopped, unlock)
 }
 
 func (b *LocalBackend) ShouldRunSSH() bool { return b.sshAtomicBool.Load() && envknob.CanSSHD() }
@@ -4568,10 +5067,11 @@ func (b *LocalBackend) ShouldHandleViaIP(ip netip.Addr) bool {
 // Logout logs out the current profile, if any, and waits for the logout to
 // complete.
 func (b *LocalBackend) Logout(ctx context.Context) error {
-	b.mu.Lock()
+	unlock := b.lockAndGetUnlock()
+	defer unlock()
+
 	if !b.hasNodeKeyLocked() {
 		// Already logged out.
-		b.mu.Unlock()
 		return nil
 	}
 	cc := b.cc
@@ -4579,19 +5079,19 @@ func (b *LocalBackend) Logout(ctx context.Context) error {
 	// Grab the current profile before we unlock the mutex, so that we can
 	// delete it later.
 	profile := b.pm.CurrentProfile()
-	b.mu.Unlock()
 
-	_, err := b.EditPrefs(&ipn.MaskedPrefs{
+	_, err := b.editPrefsLockedOnEntry(&ipn.MaskedPrefs{
 		WantRunningSet: true,
 		LoggedOutSet:   true,
 		Prefs:          ipn.Prefs{WantRunning: false, LoggedOut: true},
-	})
+	}, unlock)
 	if err != nil {
 		return err
 	}
+	// b.mu is now unlocked, after editPrefsLockedOnEntry.
 
 	// Clear any previous dial plan(s), if set.
-	b.dialPlan.Store(nil)
+	b.resetDialPlan()
 
 	if cc == nil {
 		// Double Logout can happen via repeated IPN
@@ -4607,20 +5107,15 @@ func (b *LocalBackend) Logout(ctx context.Context) error {
 	if err := cc.Logout(ctx); err != nil {
 		return err
 	}
-	b.mu.Lock()
+
+	unlock = b.lockAndGetUnlock()
+	defer unlock()
+
 	if err := b.pm.DeleteProfile(profile.ID); err != nil {
-		b.mu.Unlock()
 		b.logf("error deleting profile: %v", err)
 		return err
 	}
-	return b.resetForProfileChangeLockedOnEntry()
-}
-
-// assertClientLocked crashes if there is no controlclient in this backend.
-func (b *LocalBackend) assertClientLocked() {
-	if b.cc == nil {
-		panic("LocalBackend.assertClient: b.cc == nil")
-	}
+	return b.resetForProfileChangeLockedOnEntry(unlock)
 }
 
 // setNetInfo sets b.hostinfo.NetInfo to ni, and passes ni along to the
@@ -4628,12 +5123,68 @@ func (b *LocalBackend) assertClientLocked() {
 func (b *LocalBackend) setNetInfo(ni *tailcfg.NetInfo) {
 	b.mu.Lock()
 	cc := b.cc
+	var refresh bool
+	if b.MagicConn().DERPs() > 0 || testenv.InTest() {
+		// When b.refreshAutoExitNode is set, we recently observed a link change
+		// that indicates we have switched networks. After switching networks,
+		// the previously selected automatic exit node is no longer as likely
+		// to be a good choice and connectivity will already be broken due to
+		// the network switch. Therefore, it is a good time to switch to a new
+		// exit node because the network is already disrupted.
+		//
+		// Unfortunately, at the time of the link change, no information is
+		// known about the new network's latency or location, so the necessary
+		// details are not available to make a new choice. Instead, it sets
+		// b.refreshAutoExitNode to signal that a new decision should be made
+		// when we have an updated netcheck report. ni is that updated report.
+		//
+		// However, during testing we observed that often the first ni is
+		// inconclusive because it was running during the link change or the
+		// link was otherwise not stable yet. b.MagicConn().updateEndpoints()
+		// can detect when the netcheck failed and trigger a rebind, but the
+		// required information is not available here, and moderate additional
+		// plumbing is required to pass that in. Instead, checking for an active
+		// DERP link offers an easy approximation. We will continue to refine
+		// this over time.
+		refresh = b.refreshAutoExitNode
+		b.refreshAutoExitNode = false
+	}
 	b.mu.Unlock()
 
 	if cc == nil {
 		return
 	}
 	cc.SetNetInfo(ni)
+	if refresh {
+		unlock := b.lockAndGetUnlock()
+		defer unlock()
+		b.setAutoExitNodeIDLockedOnEntry(unlock)
+	}
+}
+
+func (b *LocalBackend) setAutoExitNodeIDLockedOnEntry(unlock unlockOnce) {
+	defer unlock()
+
+	prefs := b.pm.CurrentPrefs()
+	if !prefs.Valid() {
+		b.logf("[unexpected]: received tailnet exit node ID pref change callback but current prefs are nil")
+		return
+	}
+	prefsClone := prefs.AsStruct()
+	newSuggestion, err := b.suggestExitNodeLocked(nil)
+	if err != nil {
+		b.logf("setAutoExitNodeID: %v", err)
+		return
+	}
+	prefsClone.ExitNodeID = newSuggestion.ID
+	_, err = b.editPrefsLockedOnEntry(&ipn.MaskedPrefs{
+		Prefs:         *prefsClone,
+		ExitNodeIDSet: true,
+	}, unlock)
+	if err != nil {
+		b.logf("setAutoExitNodeID: failed to apply exit node ID preference: %v", err)
+		return
+	}
 }
 
 // setNetMapLocked updates the LocalBackend state to reflect the newly
@@ -4653,14 +5204,13 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 	if login != b.activeLogin {
 		b.logf("active login: %v", login)
 		b.activeLogin = login
-		b.lastProfileID = b.pm.CurrentProfile().ID
 	}
 	b.pauseOrResumeControlClientLocked()
 
 	if nm != nil {
-		health.SetControlHealth(nm.ControlHealth)
+		b.health.SetControlHealth(nm.ControlHealth)
 	} else {
-		health.SetControlHealth(nil)
+		b.health.SetControlHealth(nil)
 	}
 
 	// Determine if file sharing is enabled
@@ -4721,8 +5271,8 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 		}
 	}
 
-	b.updateTailFSPeersLocked(nm)
-	b.tailFSNotifyCurrentSharesLocked()
+	b.updateDrivePeersLocked(nm)
+	b.driveNotifyCurrentSharesLocked()
 }
 
 func (b *LocalBackend) updatePeersFromNetmapLocked(nm *netmap.NetworkMap) {
@@ -4749,13 +5299,6 @@ func (b *LocalBackend) updatePeersFromNetmapLocked(nm *netmap.NetworkMap) {
 	}
 }
 
-// tailFSTransport is an http.RoundTripper that uses the latest value of
-// b.Dialer().PeerAPITransport() for each round trip and imposes a short
-// dial timeout to avoid hanging on connecting to offline/unreachable hosts.
-type tailFSTransport struct {
-	b *LocalBackend
-}
-
 // responseBodyWrapper wraps an io.ReadCloser and stores
 // the number of bytesRead.
 type responseBodyWrapper struct {
@@ -4772,7 +5315,7 @@ type responseBodyWrapper struct {
 	contentLength int64
 }
 
-// logAccess logs the tailfs: access: log line. If the logger is nil,
+// logAccess logs the taildrive: access: log line. If the logger is nil,
 // the log will not be written.
 func (rbw *responseBodyWrapper) logAccess(err string) {
 	if rbw.log == nil {
@@ -4782,7 +5325,7 @@ func (rbw *responseBodyWrapper) logAccess(err string) {
 	// Some operating systems create and copy lots of 0 length hidden files for
 	// tracking various states. Omit these to keep logs from being too verbose.
 	if rbw.contentLength > 0 {
-		rbw.log("tailfs: access: %s from %s to %s: status-code=%d ext=%q content-type=%q content-length=%.f tx=%.f rx=%.f err=%q", rbw.method, rbw.selfNodeKey, rbw.shareNodeKey, rbw.statusCode, rbw.fileExtension, rbw.contentType, roundTraffic(rbw.contentLength), roundTraffic(rbw.bytesTx), roundTraffic(rbw.bytesRx), err)
+		rbw.log("taildrive: access: %s from %s to %s: status-code=%d ext=%q content-type=%q content-length=%.f tx=%.f rx=%.f err=%q", rbw.method, rbw.selfNodeKey, rbw.shareNodeKey, rbw.statusCode, rbw.fileExtension, rbw.contentType, roundTraffic(rbw.contentLength), roundTraffic(rbw.bytesTx), roundTraffic(rbw.bytesRx), err)
 	}
 }
 
@@ -4809,7 +5352,26 @@ func (rbw *responseBodyWrapper) Close() error {
 	return err
 }
 
-func (t *tailFSTransport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
+// driveTransport is an http.RoundTripper that wraps
+// b.Dialer().PeerAPITransport() with metrics tracking.
+type driveTransport struct {
+	b  *LocalBackend
+	tr *http.Transport
+}
+
+func (b *LocalBackend) newDriveTransport() *driveTransport {
+	return &driveTransport{
+		b:  b,
+		tr: b.Dialer().PeerAPITransport(),
+	}
+}
+
+func (dt *driveTransport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
+	// Some WebDAV clients include origin and refer headers, which peerapi does
+	// not like. Remove them.
+	req.Header.Del("origin")
+	req.Header.Del("referer")
+
 	bw := &requestBodyWrapper{}
 	if req.Body != nil {
 		bw.ReadCloser = req.Body
@@ -4831,24 +5393,24 @@ func (t *tailFSTransport) RoundTrip(req *http.Request) (resp *http.Response, err
 			return
 		}
 
-		t.b.mu.Lock()
-		selfNodeKey := t.b.netMap.SelfNode.Key().ShortString()
-		t.b.mu.Unlock()
-		n, _, ok := t.b.WhoIs(netip.MustParseAddrPort(req.URL.Host))
+		dt.b.mu.Lock()
+		selfNodeKey := dt.b.netMap.SelfNode.Key().ShortString()
+		dt.b.mu.Unlock()
+		n, _, ok := dt.b.WhoIs("tcp", netip.MustParseAddrPort(req.URL.Host))
 		shareNodeKey := "unknown"
 		if ok {
 			shareNodeKey = string(n.Key().ShortString())
 		}
 
 		rbw := responseBodyWrapper{
-			log:           t.b.logf,
+			log:           dt.b.logf,
 			method:        req.Method,
 			bytesTx:       int64(bw.bytesRead),
 			selfNodeKey:   selfNodeKey,
 			shareNodeKey:  shareNodeKey,
 			contentType:   contentType,
 			contentLength: resp.ContentLength,
-			fileExtension: parseTailFSFileExtensionForLog(req.URL.Path),
+			fileExtension: parseDriveFileExtensionForLog(req.URL.Path),
 			statusCode:    resp.StatusCode,
 			ReadCloser:    resp.Body,
 		}
@@ -4861,18 +5423,7 @@ func (t *tailFSTransport) RoundTrip(req *http.Request) (resp *http.Response, err
 		}
 	}()
 
-	// dialTimeout is fairly aggressive to avoid hangs on contacting offline or
-	// unreachable hosts.
-	dialTimeout := 1 * time.Second // TODO(oxtoacart): tune this
-
-	tr := t.b.Dialer().PeerAPITransport().Clone()
-	dialContext := tr.DialContext
-	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		ctxWithTimeout, cancel := context.WithTimeout(ctx, dialTimeout)
-		defer cancel()
-		return dialContext(ctxWithTimeout, network, addr)
-	}
-	return tr.RoundTrip(req)
+	return dt.tr.RoundTrip(req)
 }
 
 // roundTraffic rounds bytes. This is used to preserve user privacy within logs.
@@ -5068,7 +5619,7 @@ func (b *LocalBackend) OperatorUserID() string {
 	if opUserName == "" {
 		return ""
 	}
-	u, err := user.Lookup(opUserName)
+	u, err := osuser.LookupByUsername(opUserName)
 	if err != nil {
 		b.logf("error looking up operator %q uid: %v", opUserName, err)
 		return ""
@@ -5384,6 +5935,38 @@ func (b *LocalBackend) CheckUDPGROForwarding() error {
 	return warn
 }
 
+// SetUDPGROForwarding enables UDP GRO forwarding for the default network
+// interface of this machine. It can be done to improve performance for nodes
+// acting as Tailscale subnet routers or exit nodes. Currently (9/5/2024) this
+// functionality is considered experimental and only safe to use via explicit
+// user opt-in for ephemeral devices, such as containers.
+// https://tailscale.com/kb/1320/performance-best-practices#linux-optimizations-for-subnet-routers-and-exit-nodes
+func (b *LocalBackend) SetUDPGROForwarding() error {
+	if b.sys.IsNetstackRouter() {
+		return errors.New("UDP GRO forwarding cannot be enabled in userspace mode")
+	}
+	tunSys, ok := b.sys.Tun.GetOK()
+	if !ok {
+		return errors.New("[unexpected] unable to retrieve tun device configuration")
+	}
+	tunInterface, err := tunSys.Name()
+	if err != nil {
+		return errors.New("[unexpected] unable to determine name of the tun device")
+	}
+	netmonSys, ok := b.sys.NetMon.GetOK()
+	if !ok {
+		return errors.New("[unexpected] unable to retrieve tailscale netmon configuration")
+	}
+	state := netmonSys.InterfaceState()
+	if state == nil {
+		return errors.New("[unexpected] unable to retrieve machine's network interface state")
+	}
+	if err := netkernelconf.SetUDPGROForwarding(tunInterface, state.DefaultRouteInterface); err != nil {
+		return fmt.Errorf("error enabling UDP GRO forwarding: %w", err)
+	}
+	return nil
+}
+
 // DERPMap returns the current DERPMap in use, or nil if not connected.
 func (b *LocalBackend) DERPMap() *tailcfg.DERPMap {
 	b.mu.Lock()
@@ -5404,7 +5987,7 @@ func (b *LocalBackend) OfferingExitNode() bool {
 	}
 	var def4, def6 bool
 	ar := b.pm.CurrentPrefs().AdvertiseRoutes()
-	for i := 0; i < ar.Len(); i++ {
+	for i := range ar.Len() {
 		r := ar.At(i)
 		if r.Bits() != 0 {
 			continue
@@ -5636,13 +6219,18 @@ func (b *LocalBackend) sshServerOrInit() (_ SSHServer, err error) {
 	return b.sshServer, nil
 }
 
-var warnSSHSELinux = health.NewWarnable()
+var warnSSHSELinuxWarnable = health.Register(&health.Warnable{
+	Code:     "ssh-unavailable-selinux-enabled",
+	Title:    "Tailscale SSH and SELinux",
+	Severity: health.SeverityLow,
+	Text:     health.StaticMessage("SELinux is enabled; Tailscale SSH may not work. See https://tailscale.com/s/ssh-selinux"),
+})
 
 func (b *LocalBackend) updateSELinuxHealthWarning() {
 	if hostinfo.IsSELinuxEnforcing() {
-		warnSSHSELinux.Set(errors.New("SELinux is enabled; Tailscale SSH may not work. See https://tailscale.com/s/ssh-selinux"))
+		b.health.SetUnhealthy(warnSSHSELinuxWarnable, nil)
 	} else {
-		warnSSHSELinux.Set(nil)
+		b.health.SetHealthy(warnSSHSELinuxWarnable)
 	}
 }
 
@@ -5792,12 +6380,22 @@ func (b *LocalBackend) SwitchProfile(profile ipn.ProfileID) error {
 	if b.CurrentProfile().ID == profile {
 		return nil
 	}
-	b.mu.Lock()
+	unlock := b.lockAndGetUnlock()
+	defer unlock()
+
+	oldControlURL := b.pm.CurrentPrefs().ControlURLOrDefault()
 	if err := b.pm.SwitchProfile(profile); err != nil {
-		b.mu.Unlock()
 		return err
 	}
-	return b.resetForProfileChangeLockedOnEntry()
+
+	// As an optimization, only reset the dialPlan if the control URL
+	// changed; we treat an empty URL as "unknown" and always reset.
+	newControlURL := b.pm.CurrentPrefs().ControlURLOrDefault()
+	if oldControlURL != newControlURL || oldControlURL == "" || newControlURL == "" {
+		b.resetDialPlan()
+	}
+
+	return b.resetForProfileChangeLockedOnEntry(unlock)
 }
 
 func (b *LocalBackend) initTKALocked() error {
@@ -5847,36 +6445,49 @@ func (b *LocalBackend) initTKALocked() error {
 	return nil
 }
 
+// resetDialPlan resets the dialPlan for this LocalBackend. It will log if
+// anything is reset.
+//
+// It is safe to call this concurrently, with or without b.mu held.
+func (b *LocalBackend) resetDialPlan() {
+	old := b.dialPlan.Swap(nil)
+	if old != nil {
+		b.logf("resetDialPlan: did reset")
+	}
+}
+
 // resetForProfileChangeLockedOnEntry resets the backend for a profile change.
 //
 // b.mu must held on entry. It is released on exit.
-func (b *LocalBackend) resetForProfileChangeLockedOnEntry() error {
+func (b *LocalBackend) resetForProfileChangeLockedOnEntry(unlock unlockOnce) error {
+	defer unlock()
+
 	if b.shutdownCalled {
 		// Prevent a call back to Start during Shutdown, which calls Logout for
 		// ephemeral nodes, which can then call back here. But we're shutting
 		// down, so no need to do any work.
-		b.mu.Unlock()
 		return nil
 	}
 	b.setNetMapLocked(nil) // Reset netmap.
 	// Reset the NetworkMap in the engine
 	b.e.SetNetworkMap(new(netmap.NetworkMap))
 	if err := b.initTKALocked(); err != nil {
-		b.mu.Unlock()
 		return err
 	}
 	b.lastServeConfJSON = mem.B(nil)
 	b.serveConfig = ipn.ServeConfigView{}
-	b.enterStateLockedOnEntry(ipn.NoState) // Reset state; releases b.mu
-	health.SetLocalLogConfigHealth(nil)
+	b.lastSuggestedExitNode = ""
+	b.enterStateLockedOnEntry(ipn.NoState, unlock) // Reset state; releases b.mu
+	b.health.SetLocalLogConfigHealth(nil)
 	return b.Start(ipn.Options{})
 }
 
 // DeleteProfile deletes a profile with the given ID.
 // If the profile is not known, it is a no-op.
 func (b *LocalBackend) DeleteProfile(p ipn.ProfileID) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	unlock := b.lockAndGetUnlock()
+	defer unlock()
+
 	needToRestart := b.pm.CurrentProfile().ID == p
 	if err := b.pm.DeleteProfile(p); err != nil {
 		if err == errProfileNotFound {
@@ -5887,7 +6498,7 @@ func (b *LocalBackend) DeleteProfile(p ipn.ProfileID) error {
 	if !needToRestart {
 		return nil
 	}
-	return b.resetForProfileChangeLockedOnEntry()
+	return b.resetForProfileChangeLockedOnEntry(unlock)
 }
 
 // CurrentProfile returns the current LoginProfile.
@@ -5900,9 +6511,16 @@ func (b *LocalBackend) CurrentProfile() ipn.LoginProfile {
 
 // NewProfile creates and switches to the new profile.
 func (b *LocalBackend) NewProfile() error {
-	b.mu.Lock()
+	unlock := b.lockAndGetUnlock()
+	defer unlock()
+
 	b.pm.NewProfile()
-	return b.resetForProfileChangeLockedOnEntry()
+
+	// The new profile doesn't yet have a ControlURL because it hasn't been
+	// set. Conservatively reset the dialPlan.
+	b.resetDialPlan()
+
+	return b.resetForProfileChangeLockedOnEntry(unlock)
 }
 
 // ListProfiles returns a list of all LoginProfiles.
@@ -5917,20 +6535,21 @@ func (b *LocalBackend) ListProfiles() []ipn.LoginProfile {
 // backend is left with a new profile, ready for StartLoginInterative to be
 // called to register it as new node.
 func (b *LocalBackend) ResetAuth() error {
-	b.mu.Lock()
+	unlock := b.lockAndGetUnlock()
+	defer unlock()
+
 	prevCC := b.resetControlClientLocked()
 	if prevCC != nil {
 		defer prevCC.Shutdown() // call must happen after release b.mu
 	}
 	if err := b.clearMachineKeyLocked(); err != nil {
-		b.mu.Unlock()
 		return err
 	}
 	if err := b.pm.DeleteAllProfiles(); err != nil {
-		b.mu.Unlock()
 		return err
 	}
-	return b.resetForProfileChangeLockedOnEntry()
+	b.resetDialPlan() // always reset if we're removing everything
+	return b.resetForProfileChangeLockedOnEntry(unlock)
 }
 
 // StreamDebugCapture writes a pcap stream of packets traversing
@@ -6150,6 +6769,43 @@ func (b *LocalBackend) UnadvertiseRoute(toRemove ...netip.Prefix) error {
 	return err
 }
 
+// namespace a key with the profile manager's current profile key, if any
+func namespaceKeyForCurrentProfile(pm *profileManager, key ipn.StateKey) ipn.StateKey {
+	return pm.CurrentProfile().Key + "||" + key
+}
+
+const routeInfoStateStoreKey ipn.StateKey = "_routeInfo"
+
+func (b *LocalBackend) storeRouteInfo(ri *appc.RouteInfo) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.pm.CurrentProfile().ID == "" {
+		return nil
+	}
+	key := namespaceKeyForCurrentProfile(b.pm, routeInfoStateStoreKey)
+	bs, err := json.Marshal(ri)
+	if err != nil {
+		return err
+	}
+	return b.pm.WriteState(key, bs)
+}
+
+func (b *LocalBackend) readRouteInfoLocked() (*appc.RouteInfo, error) {
+	if b.pm.CurrentProfile().ID == "" {
+		return &appc.RouteInfo{}, nil
+	}
+	key := namespaceKeyForCurrentProfile(b.pm, routeInfoStateStoreKey)
+	bs, err := b.pm.Store().ReadState(key)
+	ri := &appc.RouteInfo{}
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(bs, ri); err != nil {
+		return nil, err
+	}
+	return ri, nil
+}
+
 // seamlessRenewalEnabled reports whether seamless key renewals are enabled
 // (i.e. we saw our self node with the SeamlessKeyRenewal attr in a netmap).
 // This enables beta functionality of renewing node keys without breaking
@@ -6194,4 +6850,361 @@ func mayDeref[T any](p *T) (v T) {
 		return v
 	}
 	return *p
+}
+
+var ErrNoPreferredDERP = errors.New("no preferred DERP, try again later")
+
+// suggestExitNodeLocked computes a suggestion based on the current netmap and last netcheck report. If
+// there are multiple equally good options, one is selected at random, so the result is not stable. To be
+// eligible for consideration, the peer must have NodeAttrSuggestExitNode in its CapMap.
+//
+// Currently, peers with a DERP home are preferred over those without (typically this means Mullvad).
+// Peers are selected based on having a DERP home that is the lowest latency to this device. For peers
+// without a DERP home, we look for geographic proximity to this device's DERP home.
+//
+// netMap is an optional netmap to use that overrides b.netMap (needed for SetControlClientStatus before b.netMap is updated).
+// If netMap is nil, then b.netMap is used.
+//
+// b.mu.lock() must be held.
+func (b *LocalBackend) suggestExitNodeLocked(netMap *netmap.NetworkMap) (response apitype.ExitNodeSuggestionResponse, err error) {
+	// netMap is an optional netmap to use that overrides b.netMap (needed for SetControlClientStatus before b.netMap is updated). If netMap is nil, then b.netMap is used.
+	if netMap == nil {
+		netMap = b.netMap
+	}
+	lastReport := b.MagicConn().GetLastNetcheckReport(b.ctx)
+	prevSuggestion := b.lastSuggestedExitNode
+
+	res, err := suggestExitNode(lastReport, netMap, prevSuggestion, randomRegion, randomNode, getAllowedSuggestions())
+	if err != nil {
+		return res, err
+	}
+	b.lastSuggestedExitNode = res.ID
+	return res, err
+}
+
+func (b *LocalBackend) SuggestExitNode() (response apitype.ExitNodeSuggestionResponse, err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.suggestExitNodeLocked(nil)
+}
+
+// selectRegionFunc returns a DERP region from the slice of candidate regions.
+// The value is returned, not the slice index.
+type selectRegionFunc func(views.Slice[int]) int
+
+// selectNodeFunc returns a node from the slice of candidate nodes. The last
+// selected node is provided for when that information is needed to make a better
+// choice.
+type selectNodeFunc func(nodes views.Slice[tailcfg.NodeView], last tailcfg.StableNodeID) tailcfg.NodeView
+
+var getAllowedSuggestions = lazy.SyncFunc(fillAllowedSuggestions)
+
+func fillAllowedSuggestions() set.Set[tailcfg.StableNodeID] {
+	nodes, err := syspolicy.GetStringArray(syspolicy.AllowedSuggestedExitNodes, nil)
+	if err != nil {
+		log.Printf("fillAllowedSuggestions: unable to look up %q policy: %v", syspolicy.AllowedSuggestedExitNodes, err)
+		return nil
+	}
+	if nodes == nil {
+		return nil
+	}
+	s := make(set.Set[tailcfg.StableNodeID], len(nodes))
+	for _, n := range nodes {
+		s.Add(tailcfg.StableNodeID(n))
+	}
+	return s
+}
+
+func suggestExitNode(report *netcheck.Report, netMap *netmap.NetworkMap, prevSuggestion tailcfg.StableNodeID, selectRegion selectRegionFunc, selectNode selectNodeFunc, allowList set.Set[tailcfg.StableNodeID]) (res apitype.ExitNodeSuggestionResponse, err error) {
+	if report == nil || report.PreferredDERP == 0 || netMap == nil || netMap.DERPMap == nil {
+		return res, ErrNoPreferredDERP
+	}
+	candidates := make([]tailcfg.NodeView, 0, len(netMap.Peers))
+	for _, peer := range netMap.Peers {
+		if !peer.Valid() {
+			continue
+		}
+		if allowList != nil && !allowList.Contains(peer.StableID()) {
+			continue
+		}
+		if peer.CapMap().Contains(tailcfg.NodeAttrSuggestExitNode) && tsaddr.ContainsExitRoutes(peer.AllowedIPs()) {
+			candidates = append(candidates, peer)
+		}
+	}
+	if len(candidates) == 0 {
+		return res, nil
+	}
+	if len(candidates) == 1 {
+		peer := candidates[0]
+		if hi := peer.Hostinfo(); hi.Valid() {
+			if loc := hi.Location(); loc != nil {
+				res.Location = loc.View()
+			}
+		}
+		res.ID = peer.StableID()
+		res.Name = peer.Name()
+		return res, nil
+	}
+
+	candidatesByRegion := make(map[int][]tailcfg.NodeView, len(netMap.DERPMap.Regions))
+	preferredDERP, ok := netMap.DERPMap.Regions[report.PreferredDERP]
+	if !ok {
+		return res, ErrNoPreferredDERP
+	}
+	var minDistance float64 = math.MaxFloat64
+	type nodeDistance struct {
+		nv       tailcfg.NodeView
+		distance float64 // in meters, approximately
+	}
+	distances := make([]nodeDistance, 0, len(candidates))
+	for _, c := range candidates {
+		if c.DERP() != "" {
+			ipp, err := netip.ParseAddrPort(c.DERP())
+			if err != nil {
+				continue
+			}
+			if ipp.Addr() != tailcfg.DerpMagicIPAddr {
+				continue
+			}
+			regionID := int(ipp.Port())
+			candidatesByRegion[regionID] = append(candidatesByRegion[regionID], c)
+			continue
+		}
+		if len(candidatesByRegion) > 0 {
+			// Since a candidate exists that does have a DERP home, skip this candidate. We never select
+			// a candidate without a DERP home if there is a candidate available with a DERP home.
+			continue
+		}
+		// This candidate does not have a DERP home.
+		// Use geographic distance from our DERP home to estimate how good this candidate is.
+		hi := c.Hostinfo()
+		if !hi.Valid() {
+			continue
+		}
+		loc := hi.Location()
+		if loc == nil {
+			continue
+		}
+		distance := longLatDistance(preferredDERP.Latitude, preferredDERP.Longitude, loc.Latitude, loc.Longitude)
+		if distance < minDistance {
+			minDistance = distance
+		}
+		distances = append(distances, nodeDistance{nv: c, distance: distance})
+	}
+	// First, try to select an exit node that has the closest DERP home, based on lastReport's DERP latency.
+	// If there are no latency values, it returns an arbitrary region
+	if len(candidatesByRegion) > 0 {
+		minRegion := minLatencyDERPRegion(xmaps.Keys(candidatesByRegion), report)
+		if minRegion == 0 {
+			minRegion = selectRegion(views.SliceOf(xmaps.Keys(candidatesByRegion)))
+		}
+		regionCandidates, ok := candidatesByRegion[minRegion]
+		if !ok {
+			return res, errors.New("no candidates in expected region: this is a bug")
+		}
+		chosen := selectNode(views.SliceOf(regionCandidates), prevSuggestion)
+		res.ID = chosen.StableID()
+		res.Name = chosen.Name()
+		if hi := chosen.Hostinfo(); hi.Valid() {
+			if loc := hi.Location(); loc != nil {
+				res.Location = loc.View()
+			}
+		}
+		return res, nil
+	}
+	// None of the candidates have a DERP home, so proceed to select based on geographical distance from our preferred DERP region.
+
+	// allowanceMeters is the extra distance that will be permitted when considering peers. By this point, there
+	// are multiple approximations taking place (DERP location standing in for this device's location, the peer's
+	// location may only be city granularity, the distance algorithm assumes a spherical planet, etc.) so it is
+	// reasonable to consider peers that are similar distances. Those peers are good enough to be within
+	// measurement error. 100km corresponds to approximately 1ms of additional round trip light
+	// propagation delay in a fiber optic cable and seems like a reasonable heuristic. It may be adjusted in
+	// future.
+	const allowanceMeters = 100000
+	pickFrom := make([]tailcfg.NodeView, 0, len(distances))
+	for _, candidate := range distances {
+		if candidate.nv.Valid() && candidate.distance <= minDistance+allowanceMeters {
+			pickFrom = append(pickFrom, candidate.nv)
+		}
+	}
+	bestCandidates := pickWeighted(pickFrom)
+	chosen := selectNode(views.SliceOf(bestCandidates), prevSuggestion)
+	if !chosen.Valid() {
+		return res, errors.New("chosen candidate invalid: this is a bug")
+	}
+	res.ID = chosen.StableID()
+	res.Name = chosen.Name()
+	if hi := chosen.Hostinfo(); hi.Valid() {
+		if loc := hi.Location(); loc != nil {
+			res.Location = loc.View()
+		}
+	}
+	return res, nil
+}
+
+// pickWeighted chooses the node with highest priority given a list of mullvad nodes.
+func pickWeighted(candidates []tailcfg.NodeView) []tailcfg.NodeView {
+	maxWeight := 0
+	best := make([]tailcfg.NodeView, 0, 1)
+	for _, c := range candidates {
+		hi := c.Hostinfo()
+		if !hi.Valid() {
+			continue
+		}
+		loc := hi.Location()
+		if loc == nil || loc.Priority < maxWeight {
+			continue
+		}
+		if maxWeight != loc.Priority {
+			best = best[:0]
+		}
+		maxWeight = loc.Priority
+		best = append(best, c)
+	}
+	return best
+}
+
+// randomRegion is a selectRegionFunc that selects a uniformly random region.
+func randomRegion(regions views.Slice[int]) int {
+	return regions.At(rand.IntN(regions.Len()))
+}
+
+// randomNode is a selectNodeFunc that will return the node matching prefer if
+// present, otherwise a uniformly random node will be selected.
+func randomNode(nodes views.Slice[tailcfg.NodeView], prefer tailcfg.StableNodeID) tailcfg.NodeView {
+	if !prefer.IsZero() {
+		for i := range nodes.Len() {
+			nv := nodes.At(i)
+			if nv.StableID() == prefer {
+				return nv
+			}
+		}
+	}
+
+	return nodes.At(rand.IntN(nodes.Len()))
+}
+
+// minLatencyDERPRegion returns the region with the lowest latency value given the last netcheck report.
+// If there are no latency values, it returns 0.
+func minLatencyDERPRegion(regions []int, report *netcheck.Report) int {
+	min := slices.MinFunc(regions, func(i, j int) int {
+		const largeDuration time.Duration = math.MaxInt64
+		iLatency, ok := report.RegionLatency[i]
+		if !ok {
+			iLatency = largeDuration
+		}
+		jLatency, ok := report.RegionLatency[j]
+		if !ok {
+			jLatency = largeDuration
+		}
+		if c := cmp.Compare(iLatency, jLatency); c != 0 {
+			return c
+		}
+		return cmp.Compare(i, j)
+	})
+	latency, ok := report.RegionLatency[min]
+	if !ok || latency == 0 {
+		return 0
+	} else {
+		return min
+	}
+}
+
+// longLatDistance returns an estimated distance given the geographic coordinates of two locations, in degrees.
+// The coordinates are separated into four separate float64 values.
+// Value is returned in meters.
+func longLatDistance(fromLat, fromLong, toLat, toLong float64) float64 {
+	const toRadians = math.Pi / 180
+	diffLat := (fromLat - toLat) * toRadians
+	diffLong := (fromLong - toLong) * toRadians
+	lat1 := fromLat * toRadians
+	lat2 := toLat * toRadians
+	a := math.Pow(math.Sin(diffLat/2), 2) + math.Cos(lat1)*math.Cos(lat2)*math.Pow(math.Sin(diffLong/2), 2)
+	const earthRadiusMeters = 6371000
+	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+	return earthRadiusMeters * c
+}
+
+// shouldAutoExitNode checks for the auto exit node MDM policy.
+func shouldAutoExitNode() bool {
+	exitNodeIDStr, _ := syspolicy.GetString(syspolicy.ExitNodeID, "")
+	return exitNodeIDStr == "auto:any"
+}
+
+// startAutoUpdate triggers an auto-update attempt. The actual update happens
+// asynchronously. If another update is in progress, an error is returned.
+func (b *LocalBackend) startAutoUpdate(logPrefix string) (retErr error) {
+	// Check if update was already started, and mark as started.
+	if !b.trySetC2NUpdateStarted() {
+		return errors.New("update already started")
+	}
+	defer func() {
+		// Clear the started flag if something failed.
+		if retErr != nil {
+			b.setC2NUpdateStarted(false)
+		}
+	}()
+
+	cmdTS, err := findCmdTailscale()
+	if err != nil {
+		return fmt.Errorf("failed to find cmd/tailscale binary: %w", err)
+	}
+	var ver struct {
+		Long string `json:"long"`
+	}
+	out, err := exec.Command(cmdTS, "version", "--json").Output()
+	if err != nil {
+		return fmt.Errorf("failed to find cmd/tailscale binary: %w", err)
+	}
+	if err := json.Unmarshal(out, &ver); err != nil {
+		return fmt.Errorf("invalid JSON from cmd/tailscale version --json: %w", err)
+	}
+	if ver.Long != version.Long() {
+		return fmt.Errorf("cmd/tailscale version %q does not match tailscaled version %q", ver.Long, version.Long())
+	}
+
+	cmd := tailscaleUpdateCmd(cmdTS)
+	buf := new(bytes.Buffer)
+	cmd.Stdout = buf
+	cmd.Stderr = buf
+	b.logf("%s: running %q", logPrefix, strings.Join(cmd.Args, " "))
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start cmd/tailscale update: %w", err)
+	}
+
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			b.logf("%s: update command failed: %v, output: %s", logPrefix, err, buf)
+		} else {
+			b.logf("%s: update attempt complete", logPrefix)
+		}
+		b.setC2NUpdateStarted(false)
+	}()
+	return nil
+}
+
+// srcIPHasCapForFilter is called by the packet filter when evaluating firewall
+// rules that require a source IP to have a certain node capability.
+//
+// TODO(bradfitz): optimize this later if/when it matters.
+func (b *LocalBackend) srcIPHasCapForFilter(srcIP netip.Addr, cap tailcfg.NodeCapability) bool {
+	if cap == "" {
+		// Shouldn't happen, but just in case.
+		// But the empty cap also shouldn't be found in Node.CapMap.
+		return false
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	nodeID, ok := b.nodeByAddr[srcIP]
+	if !ok {
+		return false
+	}
+	n, ok := b.peers[nodeID]
+	if !ok {
+		return false
+	}
+	return n.HasCap(cap)
 }

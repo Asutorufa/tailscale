@@ -24,6 +24,7 @@ import (
 	dns "golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/envknob"
+	"tailscale.com/health"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/types/dnstype"
@@ -100,6 +101,16 @@ func TestResolversWithDelays(t *testing.T) {
 			name: "nextdns-doh-input",
 			in:   q("https://dns.nextdns.io/c3a884"),
 			want: o("https://dns.nextdns.io/c3a884"),
+		},
+		{
+			name: "controld-ipv6-expand",
+			in:   q("2606:1a40:0:6:7b5b:5949:35ad:0"),
+			want: o("https://dns.controld.com/hyq3ipr2ct"),
+		},
+		{
+			name: "controld-doh-input",
+			in:   q("https://dns.controld.com/hyq3ipr2ct"),
+			want: o("https://dns.controld.com/hyq3ipr2ct"),
 		},
 	}
 
@@ -189,7 +200,7 @@ func BenchmarkNameFromQuery(b *testing.B) {
 	}
 	b.ResetTimer()
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_, err := nameFromQuery(msg)
 		if err != nil {
 			b.Fatal(err)
@@ -403,7 +414,7 @@ func makeLargeResponse(tb testing.TB, domain string) (request, response []byte) 
 		Class: dns.ClassINET,
 	})
 	builder.StartAnswers()
-	for i := 0; i < 120; i++ {
+	for i := range 120 {
 		builder.AResource(dns.ResourceHeader{
 			Name:  name,
 			Class: dns.ClassINET,
@@ -447,7 +458,7 @@ func runTestQuery(tb testing.TB, port uint16, request []byte, modify func(*forwa
 	var dialer tsdial.Dialer
 	dialer.SetNetMon(netMon)
 
-	fwd := newForwarder(tb.Logf, netMon, nil, &dialer, nil)
+	fwd := newForwarder(tb.Logf, netMon, nil, &dialer, new(health.Tracker), nil)
 	if modify != nil {
 		modify(fwd)
 	}

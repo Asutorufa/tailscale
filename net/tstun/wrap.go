@@ -1,8 +1,6 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-// Package tstun provides a TUN struct implementing the tun.Device interface
-// with additional features as required by wgengine.
 package tstun
 
 import (
@@ -12,6 +10,7 @@ import (
 	"net/netip"
 	"os"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gaissmai/bart"
+	"github.com/tailscale/wireguard-go/conn"
 	"github.com/tailscale/wireguard-go/device"
 	"github.com/tailscale/wireguard-go/tun"
 	"go4.org/mem"
@@ -33,10 +33,7 @@ import (
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
-	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
-	"tailscale.com/util/mak"
-	"tailscale.com/util/set"
 	"tailscale.com/wgengine/capture"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/wgcfg"
@@ -106,8 +103,8 @@ type Wrapper struct {
 	// timeNow, if non-nil, will be used to obtain the current time.
 	timeNow func() time.Time
 
-	// natConfig stores the current NAT configuration.
-	natConfig atomic.Pointer[natConfig]
+	// peerConfig stores the current NAT configuration.
+	peerConfig atomic.Pointer[peerConfigTable]
 
 	// vectorBuffer stores the oldest unconsumed packet vector from tdev. It is
 	// allocated in wrap() and the underlying arrays should never grow.
@@ -156,6 +153,9 @@ type Wrapper struct {
 	filter atomic.Pointer[filter.Filter]
 	// filterFlags control the verbosity of logging packet drops/accepts.
 	filterFlags filter.RunFlags
+	// jailedFilter is the packet filter for jailed nodes.
+	// Can be nil, which means drop all packets.
+	jailedFilter atomic.Pointer[filter.Filter]
 
 	// PreFilterPacketInboundFromWireGuard is the inbound filter function that runs before the main filter
 	// and therefore sees the packets that may be later dropped by it.
@@ -504,20 +504,18 @@ func (t *Wrapper) sendVectorOutbound(r tunVectorReadResult) {
 }
 
 // snat does SNAT on p if the destination address requires a different source address.
-func (t *Wrapper) snat(p *packet.Parsed) {
-	nc := t.natConfig.Load()
+func (pc *peerConfigTable) snat(p *packet.Parsed) {
 	oldSrc := p.Src.Addr()
-	newSrc := nc.selectSrcIP(oldSrc, p.Dst.Addr())
+	newSrc := pc.selectSrcIP(oldSrc, p.Dst.Addr())
 	if oldSrc != newSrc {
 		checksum.UpdateSrcAddr(p, newSrc)
 	}
 }
 
 // dnat does destination NAT on p.
-func (t *Wrapper) dnat(p *packet.Parsed) {
-	nc := t.natConfig.Load()
+func (pc *peerConfigTable) dnat(p *packet.Parsed) {
 	oldDst := p.Dst.Addr()
-	newDst := nc.mapDstIP(oldDst)
+	newDst := pc.mapDstIP(p.Src.Addr(), oldDst)
 	if newDst != oldDst {
 		checksum.UpdateDstAddr(p, newDst)
 	}
@@ -545,110 +543,70 @@ func findV6(addrs []netip.Prefix) netip.Addr {
 	return netip.Addr{}
 }
 
-// natConfig is the configuration for NAT.
-// It should be treated as immutable.
+// peerConfigTable contains configuration for individual peers and related
+// information necessary to perform peer-specific operations.  It should be
+// treated as immutable.
 //
 // The nil value is a valid configuration.
-type natConfig struct {
-	v4, v6 *natFamilyConfig
-}
+type peerConfigTable struct {
+	// nativeAddr4 and nativeAddr6 are the IPv4/IPv6 Tailscale Addresses of
+	// the current node.
+	//
+	// These are implicitly used as the address to rewrite to in the DNAT
+	// path (as configured by listenAddrs, below). The IPv4 address will be
+	// used if the inbound packet is IPv4, and the IPv6 address if the
+	// inbound packet is IPv6.
+	nativeAddr4, nativeAddr6 netip.Addr
 
-func (c *natConfig) String() string {
-	if c == nil {
-		return "<nil>"
-	}
-
-	var b strings.Builder
-	b.WriteString("natConfig{")
-	fmt.Fprintf(&b, "v4: %v, ", c.v4)
-	fmt.Fprintf(&b, "v6: %v", c.v6)
-	b.WriteString("}")
-	return b.String()
-}
-
-// mapDstIP returns the destination IP to use for a packet to dst.
-// If dst is not one of the listen addresses, it is returned as-is,
-// otherwise the native address is returned.
-func (c *natConfig) mapDstIP(oldDst netip.Addr) netip.Addr {
-	if c == nil {
-		return oldDst
-	}
-	if oldDst.Is4() {
-		return c.v4.mapDstIP(oldDst)
-	}
-	if oldDst.Is6() {
-		return c.v6.mapDstIP(oldDst)
-	}
-	return oldDst
-}
-
-// selectSrcIP returns the source IP to use for a packet to dst.
-// If the packet is not from the native address, it is returned as-is.
-func (c *natConfig) selectSrcIP(oldSrc, dst netip.Addr) netip.Addr {
-	if c == nil {
-		return oldSrc
-	}
-	if oldSrc.Is4() {
-		return c.v4.selectSrcIP(oldSrc, dst)
-	}
-	if oldSrc.Is6() {
-		return c.v6.selectSrcIP(oldSrc, dst)
-	}
-	return oldSrc
-}
-
-// natFamilyConfig is the NAT configuration for a particular
-// address family.
-// It should be treated as immutable.
-//
-// The nil value is a valid configuration.
-type natFamilyConfig struct {
-	// nativeAddr is the Tailscale Address of the current node.
-	nativeAddr netip.Addr
-
-	// listenAddrs is the set of addresses that should be
-	// mapped to the native address. These are the addresses that
-	// peers will use to connect to this node.
-	listenAddrs views.Map[netip.Addr, struct{}] // masqAddr -> struct{}
-
-	// dstMasqAddrs is the routing table used to map a given dst IP to the
-	// respective MasqueradeAsIP address. The MasqueradeAsIP address is the
-	// address that should be used as the source address for packets to dst.
-	dstMasqAddrs *bart.Table[netip.Addr]
+	// byIP contains configuration for each peer, indexed by a peer's IP
+	// address(es).
+	byIP bart.Table[*peerConfig]
 
 	// masqAddrCounts is a count of peers by MasqueradeAsIP.
+	// TODO? for logging
 	masqAddrCounts map[netip.Addr]int
 }
 
-func (c *natFamilyConfig) String() string {
+// peerConfig is the configuration for a single peer.
+type peerConfig struct {
+	// dstMasqAddr{4,6} are the addresses that should be used as the
+	// source address when masquerading packets to this peer (i.e.
+	// SNAT). If an address is not valid, the packet should not be
+	// masqueraded for that address family.
+	dstMasqAddr4 netip.Addr
+	dstMasqAddr6 netip.Addr
+
+	// jailed is whether this peer is "jailed" (i.e. is restricted from being
+	// able to initiate connections to this node). This is the case for shared
+	// nodes.
+	jailed bool
+}
+
+func (c *peerConfigTable) String() string {
 	if c == nil {
-		return "natFamilyConfig(nil)"
+		return "peerConfigTable(nil)"
 	}
 	var b strings.Builder
-	b.WriteString("natFamilyConfig{")
-	fmt.Fprintf(&b, "nativeAddr: %v, ", c.nativeAddr)
-	fmt.Fprint(&b, "listenAddrs: [")
+	b.WriteString("peerConfigTable{")
+	fmt.Fprintf(&b, "nativeAddr4: %v, ", c.nativeAddr4)
+	fmt.Fprintf(&b, "nativeAddr6: %v, ", c.nativeAddr6)
 
-	i := 0
-	c.listenAddrs.Range(func(k netip.Addr, _ struct{}) bool {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString(k.String())
-		i++
-		return true
-	})
+	// TODO: figure out how to iterate/debug/print c.byIP
 
-	i = 0
-	b.WriteString("], dstMasqAddrs: [")
-	for k, v := range c.masqAddrCounts {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		fmt.Fprintf(&b, "%v: %v peers", k, v)
-		i++
+	b.WriteString("}")
+
+	return b.String()
+}
+
+func (c *peerConfig) String() string {
+	if c == nil {
+		return "peerConfig(nil)"
 	}
-	b.WriteString("]}")
+	var b strings.Builder
+	b.WriteString("peerConfig{")
+	fmt.Fprintf(&b, "dstMasqAddr4: %v, ", c.dstMasqAddr4)
+	fmt.Fprintf(&b, "dstMasqAddr6: %v, ", c.dstMasqAddr6)
+	fmt.Fprintf(&b, "jailed: %v}", c.jailed)
 
 	return b.String()
 }
@@ -656,56 +614,85 @@ func (c *natFamilyConfig) String() string {
 // mapDstIP returns the destination IP to use for a packet to dst.
 // If dst is not one of the listen addresses, it is returned as-is,
 // otherwise the native address is returned.
-func (c *natFamilyConfig) mapDstIP(oldDst netip.Addr) netip.Addr {
-	if c == nil {
+func (pc *peerConfigTable) mapDstIP(src, oldDst netip.Addr) netip.Addr {
+	if pc == nil {
 		return oldDst
 	}
-	if _, ok := c.listenAddrs.GetOk(oldDst); ok {
-		return c.nativeAddr
+
+	// The packet we're processing is inbound from WireGuard, received from
+	// a peer. The 'src' of the packet is the remote peer's IP address,
+	// possibly the masqueraded address (if the peer is shared/etc.).
+	//
+	// The 'dst' of the packet is the address for this local node. It could
+	// be a masquerade address that we told other nodes to use, or one of
+	// our local node's Addresses.
+	c, ok := pc.byIP.Lookup(src)
+	if !ok {
+		return oldDst
+	}
+
+	if oldDst.Is4() && pc.nativeAddr4.IsValid() && c.dstMasqAddr4 == oldDst {
+		return pc.nativeAddr4
+	}
+	if oldDst.Is6() && pc.nativeAddr6.IsValid() && c.dstMasqAddr6 == oldDst {
+		return pc.nativeAddr6
 	}
 	return oldDst
 }
 
 // selectSrcIP returns the source IP to use for a packet to dst.
 // If the packet is not from the native address, it is returned as-is.
-func (c *natFamilyConfig) selectSrcIP(oldSrc, dst netip.Addr) netip.Addr {
-	if c == nil {
+func (pc *peerConfigTable) selectSrcIP(oldSrc, dst netip.Addr) netip.Addr {
+	if pc == nil {
 		return oldSrc
 	}
-	if oldSrc != c.nativeAddr {
+
+	// If this packet doesn't originate from this Tailscale node, don't
+	// SNAT it (e.g. if we're a subnet router).
+	if oldSrc.Is4() && oldSrc != pc.nativeAddr4 {
 		return oldSrc
 	}
-	eip, ok := c.dstMasqAddrs.Get(dst)
+	if oldSrc.Is6() && oldSrc != pc.nativeAddr6 {
+		return oldSrc
+	}
+
+	// Look up the configuration for the destination
+	c, ok := pc.byIP.Lookup(dst)
 	if !ok {
 		return oldSrc
 	}
-	return eip
+
+	// Perform SNAT based on the address family and whether we have a valid
+	// addr.
+	if oldSrc.Is4() && c.dstMasqAddr4.IsValid() {
+		return c.dstMasqAddr4
+	}
+	if oldSrc.Is6() && c.dstMasqAddr6.IsValid() {
+		return c.dstMasqAddr6
+	}
+
+	// No SNAT; use old src
+	return oldSrc
 }
 
-// natConfigFromWGConfig generates a natFamilyConfig from nm,
-// for the indicated address family.
-// If NAT is not required for that address family, it returns nil.
-func natConfigFromWGConfig(wcfg *wgcfg.Config, addrFam ipproto.Version) *natFamilyConfig {
+// peerConfigTableFromWGConfig generates a peerConfigTable from nm. If NAT is
+// not required, and no additional configuration is present, it returns nil.
+func peerConfigTableFromWGConfig(wcfg *wgcfg.Config) *peerConfigTable {
 	if wcfg == nil {
 		return nil
 	}
 
-	var nativeAddr netip.Addr
-	switch addrFam {
-	case ipproto.Version4:
-		nativeAddr = findV4(wcfg.Addresses)
-	case ipproto.Version6:
-		nativeAddr = findV6(wcfg.Addresses)
-	}
-	if !nativeAddr.IsValid() {
+	nativeAddr4 := findV4(wcfg.Addresses)
+	nativeAddr6 := findV6(wcfg.Addresses)
+	if !nativeAddr4.IsValid() && !nativeAddr6.IsValid() {
 		return nil
 	}
 
-	var (
-		rt             bart.Table[netip.Addr]
-		masqAddrCounts = map[netip.Addr]int{}
-		listenAddrs    set.Set[netip.Addr]
-	)
+	ret := &peerConfigTable{
+		nativeAddr4:    nativeAddr4,
+		nativeAddr6:    nativeAddr6,
+		masqAddrCounts: make(map[netip.Addr]int),
+	}
 
 	// When using an exit node that requires masquerading, we need to
 	// fill out the routing table with all peers not just the ones that
@@ -714,57 +701,97 @@ func natConfigFromWGConfig(wcfg *wgcfg.Config, addrFam ipproto.Version) *natFami
 	for _, p := range wcfg.Peers {
 		isExitNode := slices.Contains(p.AllowedIPs, tsaddr.AllIPv4()) || slices.Contains(p.AllowedIPs, tsaddr.AllIPv6())
 		if isExitNode {
-			hasMasqAddrsForFamily := false ||
-				(addrFam == ipproto.Version4 && p.V4MasqAddr != nil && p.V4MasqAddr.IsValid()) ||
-				(addrFam == ipproto.Version6 && p.V6MasqAddr != nil && p.V6MasqAddr.IsValid())
-			if hasMasqAddrsForFamily {
+			hasMasqAddr := false ||
+				(p.V4MasqAddr != nil && p.V4MasqAddr.IsValid()) ||
+				(p.V6MasqAddr != nil && p.V6MasqAddr.IsValid())
+			if hasMasqAddr {
 				exitNodeRequiresMasq = true
 			}
 			break
 		}
 	}
+
+	byIPSize := 0
 	for i := range wcfg.Peers {
 		p := &wcfg.Peers[i]
-		var addrToUse netip.Addr
-		if addrFam == ipproto.Version4 && p.V4MasqAddr != nil && p.V4MasqAddr.IsValid() {
-			addrToUse = *p.V4MasqAddr
-			mak.Set(&listenAddrs, addrToUse, struct{}{})
-		} else if addrFam == ipproto.Version6 && p.V6MasqAddr != nil && p.V6MasqAddr.IsValid() {
-			addrToUse = *p.V6MasqAddr
-			mak.Set(&listenAddrs, addrToUse, struct{}{})
-		} else if exitNodeRequiresMasq {
-			addrToUse = nativeAddr
-		} else {
+
+		// Build a routing table that configures DNAT (i.e. changing
+		// the V4MasqAddr/V6MasqAddr for a given peer to the current
+		// peer's v4/v6 IP).
+		var addrToUse4, addrToUse6 netip.Addr
+		if p.V4MasqAddr != nil && p.V4MasqAddr.IsValid() {
+			addrToUse4 = *p.V4MasqAddr
+			ret.masqAddrCounts[addrToUse4]++
+		}
+		if p.V6MasqAddr != nil && p.V6MasqAddr.IsValid() {
+			addrToUse6 = *p.V6MasqAddr
+			ret.masqAddrCounts[addrToUse6]++
+		}
+
+		// If the exit node requires masquerading, set the masquerade
+		// addresses to our native addresses.
+		if exitNodeRequiresMasq {
+			if !addrToUse4.IsValid() && nativeAddr4.IsValid() {
+				addrToUse4 = nativeAddr4
+			}
+			if !addrToUse6.IsValid() && nativeAddr6.IsValid() {
+				addrToUse6 = nativeAddr6
+			}
+		}
+
+		if !addrToUse4.IsValid() && !addrToUse6.IsValid() && !p.IsJailed {
+			// NAT not required for this peer.
 			continue
 		}
 
-		masqAddrCounts[addrToUse]++
+		// Use the same peer configuration for each address of the peer.
+		pc := &peerConfig{
+			dstMasqAddr4: addrToUse4,
+			dstMasqAddr6: addrToUse6,
+			jailed:       p.IsJailed,
+		}
+
+		// Insert an entry into our routing table for each allowed IP.
 		for _, ip := range p.AllowedIPs {
-			rt.Insert(ip, addrToUse)
+			ret.byIP.Insert(ip, pc)
+			byIPSize++
 		}
 	}
-	if len(listenAddrs) == 0 && len(masqAddrCounts) == 0 {
+	if byIPSize == 0 && len(ret.masqAddrCounts) == 0 {
 		return nil
 	}
-	return &natFamilyConfig{
-		nativeAddr:     nativeAddr,
-		listenAddrs:    views.MapOf(listenAddrs),
-		dstMasqAddrs:   &rt,
-		masqAddrCounts: masqAddrCounts,
-	}
+	return ret
 }
 
-// SetNetMap is called when a new NetworkMap is received.
-func (t *Wrapper) SetWGConfig(wcfg *wgcfg.Config) {
-	v4, v6 := natConfigFromWGConfig(wcfg, ipproto.Version4), natConfigFromWGConfig(wcfg, ipproto.Version6)
-	var cfg *natConfig
-	if v4 != nil || v6 != nil {
-		cfg = &natConfig{v4: v4, v6: v6}
+func (pc *peerConfigTable) inboundPacketIsJailed(p *packet.Parsed) bool {
+	if pc == nil {
+		return false
 	}
+	c, ok := pc.byIP.Lookup(p.Src.Addr())
+	if !ok {
+		return false
+	}
+	return c.jailed
+}
 
-	old := t.natConfig.Swap(cfg)
+func (pc *peerConfigTable) outboundPacketIsJailed(p *packet.Parsed) bool {
+	if pc == nil {
+		return false
+	}
+	c, ok := pc.byIP.Lookup(p.Dst.Addr())
+	if !ok {
+		return false
+	}
+	return c.jailed
+}
+
+// SetWGConfig is called when a new NetworkMap is received.
+func (t *Wrapper) SetWGConfig(wcfg *wgcfg.Config) {
+	cfg := peerConfigTableFromWGConfig(wcfg)
+
+	old := t.peerConfig.Swap(cfg)
 	if !reflect.DeepEqual(old, cfg) {
-		t.logf("nat config: %v", cfg)
+		t.logf("peer config: %v", cfg)
 	}
 }
 
@@ -773,7 +800,7 @@ var (
 	magicDNSIPPortv6 = netip.AddrPortFrom(tsaddr.TailscaleServiceIPv6(), 0)
 )
 
-func (t *Wrapper) filterPacketOutboundToWireGuard(p *packet.Parsed) filter.Response {
+func (t *Wrapper) filterPacketOutboundToWireGuard(p *packet.Parsed, pc *peerConfigTable) filter.Response {
 	// Fake ICMP echo responses to MagicDNS (100.100.100.100).
 	if p.IsEchoRequest() {
 		switch p.Dst {
@@ -817,7 +844,14 @@ func (t *Wrapper) filterPacketOutboundToWireGuard(p *packet.Parsed) filter.Respo
 		}
 	}
 
-	filt := t.filter.Load()
+	// If the outbound packet is to a jailed peer, use our jailed peer
+	// packet filter.
+	var filt *filter.Filter
+	if pc.outboundPacketIsJailed(p) {
+		filt = t.jailedFilter.Load()
+	} else {
+		filt = t.filter.Load()
+	}
 	if filt == nil {
 		return filter.Drop
 	}
@@ -862,13 +896,7 @@ func (t *Wrapper) Read(buffs [][]byte, sizes []int, offset int) (int, error) {
 		return 0, res.err
 	}
 	if res.data == nil {
-		n, err := t.injectedRead(res.injected, buffs[0], offset)
-		sizes[0] = n
-		if err != nil && n == 0 {
-			return 0, err
-		}
-
-		return 1, err
+		return t.injectedRead(res.injected, buffs, sizes, offset)
 	}
 
 	metricPacketOut.Add(int64(len(res.data)))
@@ -877,10 +905,10 @@ func (t *Wrapper) Read(buffs [][]byte, sizes []int, offset int) (int, error) {
 	p := parsedPacketPool.Get().(*packet.Parsed)
 	defer parsedPacketPool.Put(p)
 	captHook := t.captureHook.Load()
+	pc := t.peerConfig.Load()
 	for _, data := range res.data {
 		p.Decode(data[res.dataOffset:])
 
-		t.snat(p)
 		if m := t.destIPActivity.Load(); m != nil {
 			if fn := m[p.Dst.Addr()]; fn != nil {
 				fn()
@@ -890,12 +918,16 @@ func (t *Wrapper) Read(buffs [][]byte, sizes []int, offset int) (int, error) {
 			captHook(capture.FromLocal, t.now(), p.Buffer(), p.CaptureMeta)
 		}
 		if !t.disableFilter {
-			response := t.filterPacketOutboundToWireGuard(p)
+			response := t.filterPacketOutboundToWireGuard(p, pc)
 			if response != filter.Accept {
 				metricPacketOutDrop.Add(1)
 				continue
 			}
 		}
+
+		// Make sure to do SNAT after filtering, so that any flow tracking in
+		// the filter sees the original source address. See #12133.
+		pc.snat(p)
 		n := copy(buffs[buffsPos][offset:], p.Buffer())
 		if n != len(data)-res.dataOffset {
 			panic(fmt.Sprintf("short copy: %d != %d", n, len(data)-res.dataOffset))
@@ -919,25 +951,85 @@ func (t *Wrapper) Read(buffs [][]byte, sizes []int, offset int) (int, error) {
 	return buffsPos, res.err
 }
 
-// injectedRead handles injected reads, which bypass filters.
-func (t *Wrapper) injectedRead(res tunInjectedRead, buf []byte, offset int) (int, error) {
-	metricPacketOut.Add(1)
+const (
+	minTCPHeaderSize = 20
+)
 
-	var n int
-	if !res.packet.IsNil() {
-
-		n = copy(buf[offset:], res.packet.NetworkHeader().Slice())
-		n += copy(buf[offset+n:], res.packet.TransportHeader().Slice())
-		n += copy(buf[offset+n:], res.packet.Data().AsRange().ToSlice())
-		res.packet.DecRef()
-	} else {
-		n = copy(buf[offset:], res.data)
+func stackGSOToTunGSO(pkt []byte, gso stack.GSO) (tun.GSOOptions, error) {
+	options := tun.GSOOptions{
+		CsumStart:  gso.L3HdrLen,
+		CsumOffset: gso.CsumOffset,
+		GSOSize:    gso.MSS,
+		NeedsCsum:  gso.NeedsCsum,
 	}
+	switch gso.Type {
+	case stack.GSONone:
+		options.GSOType = tun.GSONone
+		return options, nil
+	case stack.GSOTCPv4:
+		options.GSOType = tun.GSOTCPv4
+	case stack.GSOTCPv6:
+		options.GSOType = tun.GSOTCPv6
+	default:
+		return tun.GSOOptions{}, fmt.Errorf("unsupported gVisor GSOType: %v", gso.Type)
+	}
+	// options.HdrLen is both layer 3 and 4 together, whereas gVisor only
+	// gives us layer 3 length. We have to gather TCP header length
+	// ourselves.
+	if len(pkt) < int(gso.L3HdrLen)+minTCPHeaderSize {
+		return tun.GSOOptions{}, errors.New("gVisor GSOTCP packet length too short")
+	}
+	tcphLen := uint16(pkt[int(gso.L3HdrLen)+12] >> 4 * 4)
+	options.HdrLen = gso.L3HdrLen + tcphLen
+	return options, nil
+}
+
+func invertGSOChecksum(pkt []byte, gso stack.GSO) {
+	if gso.NeedsCsum != true {
+		return
+	}
+	at := int(gso.L3HdrLen + gso.CsumOffset)
+	if at+1 > len(pkt)-1 {
+		return
+	}
+	pkt[at] = ^pkt[at]
+	pkt[at+1] = ^pkt[at+1]
+}
+
+// injectedRead handles injected reads, which bypass filters.
+func (t *Wrapper) injectedRead(res tunInjectedRead, outBuffs [][]byte, sizes []int, offset int) (n int, err error) {
+	var gso stack.GSO
+
+	pkt := outBuffs[0][offset:]
+	if res.packet != nil {
+		bufN := copy(pkt, res.packet.NetworkHeader().Slice())
+		bufN += copy(pkt[bufN:], res.packet.TransportHeader().Slice())
+		bufN += copy(pkt[bufN:], res.packet.Data().AsRange().ToSlice())
+		gso = res.packet.GSOOptions
+		pkt = pkt[:bufN]
+		defer res.packet.DecRef() // defer DecRef so we may continue to reference it
+	} else {
+		sizes[0] = copy(pkt, res.data)
+		pkt = pkt[:sizes[0]]
+		n = 1
+	}
+
+	pc := t.peerConfig.Load()
 
 	p := parsedPacketPool.Get().(*packet.Parsed)
 	defer parsedPacketPool.Put(p)
-	p.Decode(buf[offset : offset+n])
-	t.snat(p)
+	p.Decode(pkt)
+
+	// We invert the transport layer checksum before and after snat() if gVisor
+	// handed us a segment with a partial checksum. A partial checksum is not a
+	// ones' complement of the sum, and incremental checksum updating that could
+	// occur as a result of snat() is not aware of this. Alternatively we could
+	// plumb partial transport layer checksum awareness down through snat(),
+	// but the surface area of such a change is much larger, and not yet
+	// justified by this singular case.
+	invertGSOChecksum(pkt, gso)
+	pc.snat(p)
+	invertGSOChecksum(pkt, gso)
 
 	if m := t.destIPActivity.Load(); m != nil {
 		if fn := m[p.Dst.Addr()]; fn != nil {
@@ -945,14 +1037,27 @@ func (t *Wrapper) injectedRead(res tunInjectedRead, buf []byte, offset int) (int
 		}
 	}
 
-	if stats := t.stats.Load(); stats != nil {
-		stats.UpdateTxVirtual(buf[offset:][:n])
+	if res.packet != nil {
+		var gsoOptions tun.GSOOptions
+		gsoOptions, err = stackGSOToTunGSO(pkt, gso)
+		if err != nil {
+			return 0, err
+		}
+		n, err = tun.GSOSplit(pkt, gsoOptions, outBuffs, sizes, offset)
 	}
+
+	if stats := t.stats.Load(); stats != nil {
+		for i := 0; i < n; i++ {
+			stats.UpdateTxVirtual(outBuffs[i][offset : offset+sizes[i]])
+		}
+	}
+
 	t.noteActivity()
-	return n, nil
+	metricPacketOut.Add(int64(n))
+	return n, err
 }
 
-func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook capture.Callback) filter.Response {
+func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook capture.Callback, pc *peerConfigTable) filter.Response {
 	if captHook != nil {
 		captHook(capture.FromPeer, t.now(), p.Buffer(), p.CaptureMeta)
 	}
@@ -994,11 +1099,15 @@ func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook ca
 		}
 	}
 
-	filt := t.filter.Load()
+	var filt *filter.Filter
+	if pc.inboundPacketIsJailed(p) {
+		filt = t.jailedFilter.Load()
+	} else {
+		filt = t.filter.Load()
+	}
 	if filt == nil {
 		return filter.Drop
 	}
-
 	outcome := filt.RunIn(p, t.filterFlags)
 
 	// Let peerapi through the filter; its ACLs are handled at L7,
@@ -1057,11 +1166,12 @@ func (t *Wrapper) Write(buffs [][]byte, offset int) (int, error) {
 	p := parsedPacketPool.Get().(*packet.Parsed)
 	defer parsedPacketPool.Put(p)
 	captHook := t.captureHook.Load()
+	pc := t.peerConfig.Load()
 	for _, buff := range buffs {
 		p.Decode(buff[offset:])
-		t.dnat(p)
+		pc.dnat(p)
 		if !t.disableFilter {
-			if t.filterPacketInboundFromWireGuard(p, captHook) != filter.Accept {
+			if t.filterPacketInboundFromWireGuard(p, captHook, pc) != filter.Accept {
 				metricPacketInDrop.Add(1)
 			} else {
 				buffs[i] = buff
@@ -1099,6 +1209,14 @@ func (t *Wrapper) SetFilter(filt *filter.Filter) {
 	t.filter.Store(filt)
 }
 
+func (t *Wrapper) GetJailedFilter() *filter.Filter {
+	return t.jailedFilter.Load()
+}
+
+func (t *Wrapper) SetJailedFilter(filt *filter.Filter) {
+	t.jailedFilter.Store(filt)
+}
+
 // InjectInboundPacketBuffer makes the Wrapper device behave as if a packet
 // with the given contents was received from the network.
 // It takes ownership of one reference count on the packet. The injected
@@ -1117,6 +1235,8 @@ func (t *Wrapper) InjectInboundPacketBuffer(pkt *stack.PacketBuffer) error {
 	}
 	pkt.DecRef()
 
+	pc := t.peerConfig.Load()
+
 	p := parsedPacketPool.Get().(*packet.Parsed)
 	defer parsedPacketPool.Put(p)
 	p.Decode(buf[PacketStartOffset:])
@@ -1124,7 +1244,8 @@ func (t *Wrapper) InjectInboundPacketBuffer(pkt *stack.PacketBuffer) error {
 	if captHook != nil {
 		captHook(capture.SynthesizedToLocal, t.now(), p.Buffer(), p.CaptureMeta)
 	}
-	t.dnat(p)
+
+	pc.dnat(p)
 
 	return t.InjectInboundDirect(buf, PacketStartOffset)
 }
@@ -1234,6 +1355,14 @@ func (t *Wrapper) InjectOutboundPacketBuffer(pkt *stack.PacketBuffer) error {
 }
 
 func (t *Wrapper) BatchSize() int {
+	if runtime.GOOS == "linux" {
+		// Always setup Linux to handle vectors, even in the very rare case that
+		// the underlying t.tdev returns 1. gVisor GSO is always enabled for
+		// Linux, and we cannot make a determination on gVisor usage at
+		// wireguard-go.Device startup, which is when this value matters for
+		// packet memory init.
+		return conn.IdealBatchSize
+	}
 	return t.tdev.BatchSize()
 }
 

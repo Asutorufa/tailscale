@@ -22,6 +22,8 @@ import (
 	"reflect"
 
 	"tailscale.com/control/controlknobs"
+	"tailscale.com/drive"
+	"tailscale.com/health"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/conffile"
 	"tailscale.com/net/dns"
@@ -29,7 +31,6 @@ import (
 	"tailscale.com/net/tsdial"
 	"tailscale.com/net/tstun"
 	"tailscale.com/proxymap"
-	"tailscale.com/tailfs"
 	"tailscale.com/types/netmap"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/magicsock"
@@ -38,18 +39,18 @@ import (
 
 // System contains all the subsystems of a Tailscale node (tailscaled, etc.)
 type System struct {
-	Dialer          SubSystem[*tsdial.Dialer]
-	DNSManager      SubSystem[*dns.Manager] // can get its *resolver.Resolver from DNSManager.Resolver
-	Engine          SubSystem[wgengine.Engine]
-	NetMon          SubSystem[*netmon.Monitor]
-	MagicSock       SubSystem[*magicsock.Conn]
-	NetstackRouter  SubSystem[bool] // using Netstack at all (either entirely or at least for subnets)
-	Router          SubSystem[router.Router]
-	Tun             SubSystem[*tstun.Wrapper]
-	StateStore      SubSystem[ipn.StateStore]
-	Netstack        SubSystem[NetstackImpl] // actually a *netstack.Impl
-	TailFSForLocal  SubSystem[tailfs.FileSystemForLocal]
-	TailFSForRemote SubSystem[tailfs.FileSystemForRemote]
+	Dialer         SubSystem[*tsdial.Dialer]
+	DNSManager     SubSystem[*dns.Manager] // can get its *resolver.Resolver from DNSManager.Resolver
+	Engine         SubSystem[wgengine.Engine]
+	NetMon         SubSystem[*netmon.Monitor]
+	MagicSock      SubSystem[*magicsock.Conn]
+	NetstackRouter SubSystem[bool] // using Netstack at all (either entirely or at least for subnets)
+	Router         SubSystem[router.Router]
+	Tun            SubSystem[*tstun.Wrapper]
+	StateStore     SubSystem[ipn.StateStore]
+	Netstack       SubSystem[NetstackImpl] // actually a *netstack.Impl
+	DriveForLocal  SubSystem[drive.FileSystemForLocal]
+	DriveForRemote SubSystem[drive.FileSystemForRemote]
 
 	// InitialConfig is initial server config, if any.
 	// It is nil if the node is not in declarative mode.
@@ -63,6 +64,8 @@ type System struct {
 
 	controlKnobs controlknobs.Knobs
 	proxyMap     proxymap.Mapper
+
+	healthTracker health.Tracker
 }
 
 // NetstackImpl is the interface that *netstack.Impl implements.
@@ -101,10 +104,10 @@ func (s *System) Set(v any) {
 		s.StateStore.Set(v)
 	case NetstackImpl:
 		s.Netstack.Set(v)
-	case tailfs.FileSystemForLocal:
-		s.TailFSForLocal.Set(v)
-	case tailfs.FileSystemForRemote:
-		s.TailFSForRemote.Set(v)
+	case drive.FileSystemForLocal:
+		s.DriveForLocal.Set(v)
+	case drive.FileSystemForRemote:
+		s.DriveForRemote.Set(v)
 	default:
 		panic(fmt.Sprintf("unknown type %T", v))
 	}
@@ -132,6 +135,11 @@ func (s *System) ControlKnobs() *controlknobs.Knobs {
 // ProxyMapper returns the ephemeral ip:port mapper.
 func (s *System) ProxyMapper() *proxymap.Mapper {
 	return &s.proxyMap
+}
+
+// HealthTracker returns the system health tracker.
+func (s *System) HealthTracker() *health.Tracker {
+	return &s.healthTracker
 }
 
 // SubSystem represents some subsystem of the Tailscale node daemon.

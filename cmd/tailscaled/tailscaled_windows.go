@@ -42,13 +42,13 @@ import (
 	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.zx2c4.com/wintun"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
+	"tailscale.com/drive/driveimpl"
 	"tailscale.com/envknob"
 	"tailscale.com/logpolicy"
 	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/tstun"
-	"tailscale.com/tailfs/tailfsimpl"
 	"tailscale.com/tsd"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
@@ -131,7 +131,7 @@ var syslogf logger.Logf = logger.Discard
 // Windows started.
 func runWindowsService(pol *logpolicy.Policy) error {
 	go func() {
-		osdiag.LogSupportInfo(logger.WithPrefix(log.Printf, "Support Info: "), osdiag.LogSupportInfoReasonStartup)
+		logger.Logf(log.Printf).JSON(1, "SupportInfo", osdiag.SupportInfo(osdiag.LogSupportInfoReasonStartup))
 	}()
 
 	if logSCMInteractions, _ := syspolicy.GetBoolean(syspolicy.LogSCMInteractions, false); logSCMInteractions {
@@ -316,7 +316,7 @@ func beWindowsSubprocess() bool {
 	}
 	sys.Set(netMon)
 
-	sys.Set(tailfsimpl.NewFileSystemForRemote(log.Printf))
+	sys.Set(driveimpl.NewFileSystemForRemote(log.Printf))
 
 	publicLogID, _ := logid.ParsePublicID(logID)
 	err = startIPNServer(ctx, log.Printf, publicLogID, sys)
@@ -435,6 +435,9 @@ func babysitProc(ctx context.Context, args []string, logf logger.Logf) {
 		startTime := time.Now()
 		log.Printf("exec: %#v %v", executable, args)
 		cmd := exec.Command(executable, args...)
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			CreationFlags: windows.DETACHED_PROCESS,
+		}
 
 		// Create a pipe object to use as the subproc's stdin.
 		// When the writer goes away, the reader gets EOF.

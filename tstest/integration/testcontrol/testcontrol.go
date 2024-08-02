@@ -13,7 +13,8 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
+	"maps"
+	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -24,7 +25,8 @@ import (
 	"sync"
 	"time"
 
-	"go4.org/mem"
+	"golang.org/x/net/http2"
+	"tailscale.com/control/controlhttp"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
@@ -50,6 +52,7 @@ type Server struct {
 	Verbose        bool
 	DNSConfig      *tailcfg.DNSConfig // nil means no DNS config
 	MagicDNSDomain string
+	HandleC2N      http.Handler // if non-nil, used for /some-c2n-path/ in tests
 
 	// ExplicitBaseURL or HTTPTestServer must be set.
 	ExplicitBaseURL string           // e.g. "http://127.0.0.1:1234" with no trailing URL
@@ -68,6 +71,9 @@ type Server struct {
 	// by the specified node.
 	nodeSubnetRoutes map[key.NodePublic][]netip.Prefix
 
+	// peerIsJailed is the set of peers that are jailed for a node.
+	peerIsJailed map[key.NodePublic]map[key.NodePublic]bool // node => peer => isJailed
+
 	// masquerades is the set of masquerades that should be applied to
 	// MapResponses sent to clients. It is keyed by the requesting nodes
 	// public key, and then the peer node's public key. The value is the
@@ -82,7 +88,7 @@ type Server struct {
 	suppressAutoMapResponses set.Set[key.NodePublic]
 
 	noisePubKey  key.MachinePublic
-	noisePrivKey key.ControlPrivate // not strictly needed vs. MachinePrivate, but handy to test type interactions.
+	noisePrivKey key.MachinePrivate
 
 	nodes         map[key.NodePublic]*tailcfg.Node
 	users         map[key.NodePublic]*tailcfg.User
@@ -253,6 +259,10 @@ func (s *Server) initMux() {
 	})
 	s.mux.HandleFunc("/key", s.serveKey)
 	s.mux.HandleFunc("/machine/", s.serveMachine)
+	s.mux.HandleFunc("/ts2021", s.serveNoiseUpgrade)
+	if s.HandleC2N != nil {
+		s.mux.Handle("/some-c2n-path/", s.HandleC2N)
+	}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -266,6 +276,36 @@ func (s *Server) serveUnhandled(w http.ResponseWriter, r *http.Request) {
 	go panic(fmt.Sprintf("testcontrol.Server received unhandled request: %s", got.Bytes()))
 }
 
+type peerMachinePublicContextKey struct{}
+
+func (s *Server) serveNoiseUpgrade(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	if r.Method != "POST" {
+		http.Error(w, "POST required", 400)
+		return
+	}
+
+	s.mu.Lock()
+	noisePrivate := s.noisePrivKey
+	s.mu.Unlock()
+	cc, err := controlhttp.AcceptHTTP(ctx, w, r, noisePrivate, nil)
+	if err != nil {
+		log.Printf("AcceptHTTP: %v", err)
+		return
+	}
+	defer cc.Close()
+
+	var h2srv http2.Server
+	peerPub := cc.Peer()
+
+	h2srv.ServeConn(cc, &http2.ServeConnOpts{
+		Context: context.WithValue(ctx, peerMachinePublicContextKey{}, peerPub),
+		BaseConfig: &http.Server{
+			Handler: s.mux,
+		},
+	})
+}
+
 func (s *Server) publicKeys() (noiseKey, pubKey key.MachinePublic) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -273,63 +313,50 @@ func (s *Server) publicKeys() (noiseKey, pubKey key.MachinePublic) {
 	return s.noisePubKey, s.pubKey
 }
 
-func (s *Server) privateKey() key.ControlPrivate {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.ensureKeyPairLocked()
-	return s.privKey
-}
-
 func (s *Server) ensureKeyPairLocked() {
 	if !s.pubKey.IsZero() {
 		return
 	}
-	s.noisePrivKey = key.NewControl()
+	s.noisePrivKey = key.NewMachine()
 	s.noisePubKey = s.noisePrivKey.Public()
 	s.privKey = key.NewControl()
 	s.pubKey = s.privKey.Public()
 }
 
 func (s *Server) serveKey(w http.ResponseWriter, r *http.Request) {
-	_, legacyKey := s.publicKeys()
+	noiseKey, legacyKey := s.publicKeys()
 	if r.FormValue("v") == "" {
 		w.Header().Set("Content-Type", "text/plain")
 		io.WriteString(w, legacyKey.UntypedHexString())
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	// TODO(maisem/bradfitz): support noise protocol here.
 	json.NewEncoder(w).Encode(&tailcfg.OverTLSPublicKeyResponse{
 		LegacyPublicKey: legacyKey,
-		// PublicKey:       noiseKey,
+		PublicKey:       noiseKey,
 	})
 }
 
 func (s *Server) serveMachine(w http.ResponseWriter, r *http.Request) {
-	mkeyStr := strings.TrimPrefix(r.URL.Path, "/machine/")
-	rem := ""
-	if i := strings.IndexByte(mkeyStr, '/'); i != -1 {
-		rem = mkeyStr[i:]
-		mkeyStr = mkeyStr[:i]
-	}
-
-	// TODO(maisem/bradfitz): support noise protocol here.
-	mkey, err := key.ParseMachinePublicUntyped(mem.S(mkeyStr))
-	if err != nil {
-		http.Error(w, "bad machine key hex", 400)
-		return
-	}
-
 	if r.Method != "POST" {
 		http.Error(w, "POST required", 400)
 		return
 	}
+	ctx := r.Context()
 
-	switch rem {
-	case "":
-		s.serveRegister(w, r, mkey)
-	case "/map":
+	mkey, ok := ctx.Value(peerMachinePublicContextKey{}).(key.MachinePublic)
+	if !ok {
+		panic("no peer machine public key in context")
+	}
+
+	switch r.URL.Path {
+	case "/machine/map":
 		s.serveMap(w, r, mkey)
+	case "/machine/register":
+		s.serveRegister(w, r, mkey)
+	case "/machine/update-health":
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusNoContent)
 	default:
 		s.serveUnhandled(w, r)
 	}
@@ -353,6 +380,20 @@ type MasqueradePair struct {
 	Node              key.NodePublic
 	Peer              key.NodePublic
 	NodeMasqueradesAs netip.Addr
+}
+
+// SetJailed sets b to be jailed when it is a peer of a.
+func (s *Server) SetJailed(a, b key.NodePublic, jailed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.peerIsJailed == nil {
+		s.peerIsJailed = map[key.NodePublic]map[key.NodePublic]bool{}
+	}
+	if s.peerIsJailed[a] == nil {
+		s.peerIsJailed[a] = map[key.NodePublic]bool{}
+	}
+	s.peerIsJailed[a][b] = jailed
+	s.updateLocked("SetJailed", s.nodeIDsLocked(0))
 }
 
 // SetMasqueradeAddresses sets the masquerade addresses for the server.
@@ -549,7 +590,7 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.
 	}
 
 	var req tailcfg.RegisterRequest
-	if err := s.decode(mkey, msg, &req); err != nil {
+	if err := s.decode(msg, &req); err != nil {
 		go panic(fmt.Sprintf("serveRegister: decode: %v", err))
 	}
 	if req.Version == 0 {
@@ -562,8 +603,8 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.
 		j, _ := json.MarshalIndent(req, "", "\t")
 		log.Printf("Got %T: %s", req, j)
 	}
-	if s.RequireAuthKey != "" && req.Auth.AuthKey != s.RequireAuthKey {
-		res := must.Get(s.encode(mkey, false, tailcfg.RegisterResponse{
+	if s.RequireAuthKey != "" && (req.Auth == nil || req.Auth.AuthKey != s.RequireAuthKey) {
+		res := must.Get(s.encode(false, tailcfg.RegisterResponse{
 			Error: "invalid authkey",
 		}))
 		w.WriteHeader(200)
@@ -637,7 +678,7 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.
 		authURL = s.BaseURL() + authPath
 	}
 
-	res, err := s.encode(mkey, false, tailcfg.RegisterResponse{
+	res, err := s.encode(false, tailcfg.RegisterResponse{
 		User:              *user,
 		Login:             *login,
 		NodeKeyExpired:    allExpired,
@@ -729,11 +770,11 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.Machi
 	r.Body.Close()
 
 	req := new(tailcfg.MapRequest)
-	if err := s.decode(mkey, msg, req); err != nil {
+	if err := s.decode(msg, req); err != nil {
 		go panic(fmt.Sprintf("bad map request: %v", err))
 	}
 
-	jitter := time.Duration(rand.Intn(8000)) * time.Millisecond
+	jitter := rand.N(8 * time.Second)
 	keepAlive := 50*time.Second + jitter
 
 	node := s.Node(req.NodeKey)
@@ -891,7 +932,12 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 		// node key rotated away (once test server supports that)
 		return nil, nil
 	}
-	node.CapMap = s.nodeCapMaps[nk]
+
+	s.mu.Lock()
+	nodeCapMap := maps.Clone(s.nodeCapMaps[nk])
+	s.mu.Unlock()
+
+	node.CapMap = nodeCapMap
 	node.Capabilities = append(node.Capabilities, tailcfg.NodeAttrDisableUPnP)
 
 	user, _ := s.getUser(nk)
@@ -916,6 +962,7 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 
 	s.mu.Lock()
 	nodeMasqs := s.masquerades[node.Key]
+	jailed := maps.Clone(s.peerIsJailed[node.Key])
 	s.mu.Unlock()
 	for _, p := range s.AllNodes() {
 		if p.StableID == node.StableID {
@@ -928,6 +975,7 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 				p.SelfNodeV4MasqAddrForThisPeer = ptr.To(masqIP)
 			}
 		}
+		p.IsJailed = jailed[p.Key]
 
 		s.mu.Lock()
 		peerAddress := s.masquerades[p.Key][node.Key]
@@ -1011,7 +1059,7 @@ func (s *Server) takeRawMapMessage(nk key.NodePublic) (mapResJSON []byte, ok boo
 }
 
 func (s *Server) sendMapMsg(w http.ResponseWriter, mkey key.MachinePublic, compress bool, msg any) error {
-	resBytes, err := s.encode(mkey, compress, msg)
+	resBytes, err := s.encode(compress, msg)
 	if err != nil {
 		return err
 	}
@@ -1034,19 +1082,14 @@ func (s *Server) sendMapMsg(w http.ResponseWriter, mkey key.MachinePublic, compr
 	return nil
 }
 
-func (s *Server) decode(mkey key.MachinePublic, msg []byte, v any) error {
+func (s *Server) decode(msg []byte, v any) error {
 	if len(msg) == msgLimit {
 		return errors.New("encrypted message too long")
 	}
-
-	decrypted, ok := s.privateKey().OpenFrom(mkey, msg)
-	if !ok {
-		return errors.New("can't decrypt request")
-	}
-	return json.Unmarshal(decrypted, v)
+	return json.Unmarshal(msg, v)
 }
 
-func (s *Server) encode(mkey key.MachinePublic, compress bool, v any) (b []byte, err error) {
+func (s *Server) encode(compress bool, v any) (b []byte, err error) {
 	var isBytes bool
 	if b, isBytes = v.([]byte); !isBytes {
 		b, err = json.Marshal(v)
@@ -1057,7 +1100,7 @@ func (s *Server) encode(mkey key.MachinePublic, compress bool, v any) (b []byte,
 	if compress {
 		b = zstdframe.AppendEncode(nil, b, zstdframe.FastestCompression)
 	}
-	return s.privateKey().SealTo(mkey, b), nil
+	return b, nil
 }
 
 // filterInvalidIPv6Endpoints removes invalid IPv6 endpoints from eps,

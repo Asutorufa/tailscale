@@ -1,6 +1,8 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+// Package ipnserver runs the LocalAPI HTTP server that communicates
+// with the LocalBackend.
 package ipnserver
 
 import (
@@ -45,9 +47,6 @@ type Server struct {
 	// connection (such as on Windows by default). Even if this
 	// is true, the ForceDaemon pref can override this.
 	resetOnZero bool
-
-	startBackendOnce sync.Once
-	runCalled        atomic.Bool
 
 	// mu guards the fields that follow.
 	// lock order: mu, then LocalBackend.mu
@@ -199,7 +198,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	defer onDone()
 
 	if strings.HasPrefix(r.URL.Path, "/localapi/") {
-		lah := localapi.NewHandler(lb, s.logf, s.netMon, s.backendLogID)
+		lah := localapi.NewHandler(lb, s.logf, s.backendLogID)
 		lah.PermitRead, lah.PermitWrite = s.localAPIPermissions(ci)
 		lah.PermitCert = s.connCanFetchCerts(ci)
 		lah.ConnIdentity = ci
@@ -342,7 +341,7 @@ func userIDFromString(v string) string {
 }
 
 func isAllDigit(s string) bool {
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		if b := s[i]; b < '0' || b > '9' {
 			return false
 		}
@@ -471,16 +470,15 @@ func New(logf logger.Logf, logID logid.PublicID, netMon *netmon.Monitor) *Server
 
 // SetLocalBackend sets the server's LocalBackend.
 //
-// If b.Run has already been called, then lb.Start will be called.
-// Otherwise Start will be called once Run is called.
+// It should only call be called after calling lb.Start.
 func (s *Server) SetLocalBackend(lb *ipnlocal.LocalBackend) {
 	if lb == nil {
 		panic("nil LocalBackend")
 	}
+
 	if !s.lb.CompareAndSwap(nil, lb) {
 		panic("already set")
 	}
-	s.startBackendIfNeeded()
 
 	s.mu.Lock()
 	s.backendWaiter.wakeAll()
@@ -488,21 +486,6 @@ func (s *Server) SetLocalBackend(lb *ipnlocal.LocalBackend) {
 
 	// TODO(bradfitz): send status update to GUI long poller waiter. See
 	// https://github.com/tailscale/tailscale/issues/6522
-}
-
-func (b *Server) startBackendIfNeeded() {
-	if !b.runCalled.Load() {
-		return
-	}
-	lb := b.lb.Load()
-	if lb == nil {
-		return
-	}
-	if lb.Prefs().Valid() {
-		b.startBackendOnce.Do(func() {
-			lb.Start(ipn.Options{})
-		})
-	}
 }
 
 // connIdentityContextKey is the http.Request.Context's context.Value key for either an
@@ -517,7 +500,6 @@ type connIdentityContextKey struct{}
 // If the Server's LocalBackend has already been set, Run starts it.
 // Otherwise, the next call to SetLocalBackend will start it.
 func (s *Server) Run(ctx context.Context, ln net.Listener) error {
-	s.runCalled.Store(true)
 	defer func() {
 		if lb := s.lb.Load(); lb != nil {
 			lb.Shutdown()
@@ -537,7 +519,6 @@ func (s *Server) Run(ctx context.Context, ln net.Listener) error {
 		ln.Close()
 	}()
 
-	s.startBackendIfNeeded()
 	systemd.Ready()
 
 	hs := &http.Server{

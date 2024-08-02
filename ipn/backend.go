@@ -8,9 +8,10 @@ import (
 	"strings"
 	"time"
 
+	"tailscale.com/drive"
+	"tailscale.com/health"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tailfs"
 	"tailscale.com/types/empty"
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
@@ -60,7 +61,7 @@ type NotifyWatchOpt uint64
 const (
 	// NotifyWatchEngineUpdates, if set, causes Engine updates to be sent to the
 	// client either regularly or when they change, without having to ask for
-	// each one via RequestEngineStatus.
+	// each one via Engine.RequestStatus.
 	NotifyWatchEngineUpdates NotifyWatchOpt = 1 << iota
 
 	NotifyInitialState  // if set, the first Notify message (sent immediately) will contain the current State + BrowseToURL + SessionID
@@ -68,8 +69,10 @@ const (
 	NotifyInitialNetMap // if set, the first Notify message (sent immediately) will contain the current NetMap
 
 	NotifyNoPrivateKeys        // if set, private keys that would normally be sent in updates are zeroed out
-	NotifyInitialTailFSShares  // if set, the first Notify message (sent immediately) will contain the current TailFS Shares
+	NotifyInitialDriveShares   // if set, the first Notify message (sent immediately) will contain the current Taildrive Shares
 	NotifyInitialOutgoingFiles // if set, the first Notify message (sent immediately) will contain the current Taildrop OutgoingFiles
+
+	NotifyInitialHealthState // if set, the first Notify message (sent immediately) will contain the current health.State of the client
 )
 
 // Notify is a communication from a backend (e.g. tailscaled) to a frontend
@@ -130,13 +133,18 @@ type Notify struct {
 	// is available.
 	ClientVersion *tailcfg.ClientVersion `json:",omitempty"`
 
-	// TailFSShares tracks the full set of current TailFSShares that we're
+	// DriveShares tracks the full set of current DriveShares that we're
 	// publishing. Some client applications, like the MacOS and Windows clients,
 	// will listen for updates to this and handle serving these shares under
 	// the identity of the unprivileged user that is running the application. A
 	// nil value here means that we're not broadcasting shares information, an
 	// empty value means that there are no shares.
-	TailFSShares views.SliceView[*tailfs.Share, tailfs.ShareView]
+	DriveShares views.SliceView[*drive.Share, drive.ShareView]
+
+	// Health is the last-known health state of the backend. When this field is
+	// non-nil, a change in health verified, and the API client should surface
+	// any changes to the user in the UI.
+	Health *health.State `json:",omitempty"`
 
 	// type is mirrored in xcode/Shared/IPN.swift
 }
@@ -176,6 +184,9 @@ func (n Notify) String() string {
 	}
 	if n.LocalTCPPort != nil {
 		fmt.Fprintf(&sb, "tcpport=%v ", n.LocalTCPPort)
+	}
+	if n.Health != nil {
+		sb.WriteString("Health{...} ")
 	}
 	s := sb.String()
 	return s[0:len(s)-1] + "}"
@@ -232,18 +243,11 @@ var DebuggableComponents = []string{
 type Options struct {
 	// FrontendLogID is the public logtail id used by the frontend.
 	FrontendLogID string
-	// LegacyMigrationPrefs are used to migrate preferences from the
-	// frontend to the backend.
-	// If non-nil, they are imported as a new profile.
-	LegacyMigrationPrefs *Prefs `json:"Prefs"`
-	// UpdatePrefs, if provided, overrides Options.LegacyMigrationPrefs
-	// *and* the Prefs already stored in the backend state, *except* for
-	// the Persist member. If you just want to provide prefs, this is
-	// probably what you want.
+	// UpdatePrefs, if provided, overrides the Prefs already stored in the
+	// backend state, *except* for the Persist member.
 	//
 	// TODO(apenwarr): Rename this to Prefs, and possibly move Prefs.Persist
-	//   elsewhere entirely (as it always should have been). Or, move the
-	//   fancy state migration stuff out of Start().
+	// elsewhere entirely (as it always should have been).
 	UpdatePrefs *Prefs
 	// AuthKey is an optional node auth key used to authorize a
 	// new node key without user interaction.

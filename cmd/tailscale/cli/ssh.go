@@ -26,7 +26,7 @@ import (
 
 var sshCmd = &ffcli.Command{
 	Name:       "ssh",
-	ShortUsage: "ssh [user@]<host> [args...]",
+	ShortUsage: "tailscale ssh [user@]<host> [args...]",
 	ShortHelp:  "SSH to a Tailscale machine",
 	LongHelp: strings.TrimSpace(`
 
@@ -52,7 +52,7 @@ func runSSH(ctx context.Context, args []string) error {
 		return errors.New("The 'tailscale ssh' subcommand is not available on macOS builds distributed through the App Store or TestFlight.\nInstall the Standalone variant of Tailscale (download it from https://pkgs.tailscale.com), or use the regular 'ssh' client instead.")
 	}
 	if len(args) == 0 {
-		return errors.New("usage: ssh [user@]<host>")
+		return errors.New("usage: tailscale ssh [user@]<host>")
 	}
 	arg, argRest := args[0], args[1:]
 	username, host, ok := strings.Cut(arg, "@")
@@ -106,14 +106,12 @@ func runSSH(ctx context.Context, args []string) error {
 		"-o", "CanonicalizeHostname no", // https://github.com/tailscale/tailscale/issues/10348
 	)
 
-	// TODO(bradfitz): nc is currently broken on macOS:
-	// https://github.com/tailscale/tailscale/issues/4529
-	// So don't use it for now. MagicDNS is usually working on macOS anyway
-	// and they're not in userspace mode, so 'nc' isn't very useful.
+	// MagicDNS is usually working on macOS anyway and they're not in userspace
+	// mode, so 'nc' isn't very useful.
 	if runtime.GOOS != "darwin" {
 		socketArg := ""
-		if rootArgs.socket != "" && rootArgs.socket != paths.DefaultTailscaledSocket() {
-			socketArg = fmt.Sprintf("--socket=%q", rootArgs.socket)
+		if localClient.Socket != "" && localClient.Socket != paths.DefaultTailscaledSocket() {
+			socketArg = fmt.Sprintf("--socket=%q", localClient.Socket)
 		}
 
 		argv = append(argv,

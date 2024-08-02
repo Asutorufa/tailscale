@@ -29,17 +29,17 @@ import (
 	"github.com/kortschak/wol"
 	"golang.org/x/net/dns/dnsmessage"
 	"golang.org/x/net/http/httpguts"
+	"tailscale.com/drive"
 	"tailscale.com/envknob"
 	"tailscale.com/health"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
-	"tailscale.com/net/interfaces"
 	"tailscale.com/net/netaddr"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/netutil"
 	"tailscale.com/net/sockstats"
 	"tailscale.com/tailcfg"
 	"tailscale.com/taildrop"
-	"tailscale.com/tailfs"
 	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/httphdr"
@@ -48,10 +48,10 @@ import (
 )
 
 const (
-	tailFSPrefix = "/v0/tailfs"
+	taildrivePrefix = "/v0/drive"
 )
 
-var initListenConfig func(*net.ListenConfig, netip.Addr, *interfaces.State, string) error
+var initListenConfig func(*net.ListenConfig, netip.Addr, *netmon.State, string) error
 
 // addH2C is non-nil on platforms where we want to add H2C
 // ("cleartext" HTTP/2) support to the peerAPI.
@@ -69,7 +69,7 @@ type peerAPIServer struct {
 	taildrop *taildrop.Manager
 }
 
-func (s *peerAPIServer) listen(ip netip.Addr, ifState *interfaces.State) (ln net.Listener, err error) {
+func (s *peerAPIServer) listen(ip netip.Addr, ifState *netmon.State) (ln net.Listener, err error) {
 	// Android for whatever reason often has problems creating the peerapi listener.
 	// But since we started intercepting it with netstack, it's not even important that
 	// we have a real kernel-level listener. So just create a dummy listener on Android
@@ -187,7 +187,7 @@ func (pln *peerAPIListener) serve() {
 
 func (pln *peerAPIListener) ServeConn(src netip.AddrPort, c net.Conn) {
 	logf := pln.lb.logf
-	peerNode, peerUser, ok := pln.lb.WhoIs(src)
+	peerNode, peerUser, ok := pln.lb.WhoIs("tcp", src)
 	if !ok {
 		logf("peerapi: unknown peer %v", src)
 		c.Close()
@@ -324,8 +324,8 @@ func (h *peerAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleDNSQuery(w, r)
 		return
 	}
-	if strings.HasPrefix(r.URL.Path, tailFSPrefix) {
-		h.handleServeTailFS(w, r)
+	if strings.HasPrefix(r.URL.Path, taildrivePrefix) {
+		h.handleServeDrive(w, r)
 		return
 	}
 	switch r.URL.Path {
@@ -444,19 +444,19 @@ func (h *peerAPIHandler) handleServeInterfaces(w http.ResponseWriter, r *http.Re
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintln(w, "<h1>Interfaces</h1>")
 
-	if dr, err := interfaces.DefaultRoute(); err == nil {
+	if dr, err := netmon.DefaultRoute(); err == nil {
 		fmt.Fprintf(w, "<h3>Default route is %q(%d)</h3>\n", html.EscapeString(dr.InterfaceName), dr.InterfaceIndex)
 	} else {
 		fmt.Fprintf(w, "<h3>Could not get the default route: %s</h3>\n", html.EscapeString(err.Error()))
 	}
 
-	if hasCGNATInterface, err := interfaces.HasCGNATInterface(); hasCGNATInterface {
+	if hasCGNATInterface, err := netmon.HasCGNATInterface(); hasCGNATInterface {
 		fmt.Fprintln(w, "<p>There is another interface using the CGNAT range.</p>")
 	} else if err != nil {
 		fmt.Fprintf(w, "<p>Could not check for CGNAT interfaces: %s</p>\n", html.EscapeString(err.Error()))
 	}
 
-	i, err := interfaces.GetList()
+	i, err := netmon.GetInterfaceList()
 	if err != nil {
 		fmt.Fprintf(w, "Could not get interfaces: %s\n", html.EscapeString(err.Error()))
 		return
@@ -468,12 +468,12 @@ func (h *peerAPIHandler) handleServeInterfaces(w http.ResponseWriter, r *http.Re
 		fmt.Fprintf(w, "<th>%v</th> ", v)
 	}
 	fmt.Fprint(w, "</tr>\n")
-	i.ForeachInterface(func(iface interfaces.Interface, ipps []netip.Prefix) {
+	i.ForeachInterface(func(iface netmon.Interface, ipps []netip.Prefix) {
 		fmt.Fprint(w, "<tr>")
 		for _, v := range []any{iface.Index, iface.Name, iface.MTU, iface.Flags, ipps} {
 			fmt.Fprintf(w, "<td>%s</td> ", html.EscapeString(fmt.Sprintf("%v", v)))
 		}
-		if extras, err := interfaces.InterfaceDebugExtras(iface.Index); err == nil && extras != "" {
+		if extras, err := netmon.InterfaceDebugExtras(iface.Index); err == nil && extras != "" {
 			fmt.Fprintf(w, "<td>%s</td> ", html.EscapeString(extras))
 		} else if err != nil {
 			fmt.Fprintf(w, "<td>%s</td> ", html.EscapeString(err.Error()))
@@ -1141,37 +1141,37 @@ func (rbw *requestBodyWrapper) Read(b []byte) (int, error) {
 	return n, err
 }
 
-func (h *peerAPIHandler) handleServeTailFS(w http.ResponseWriter, r *http.Request) {
-	if !h.ps.b.TailFSSharingEnabled() {
-		h.logf("tailfs: not enabled")
-		http.Error(w, "tailfs not enabled", http.StatusNotFound)
+func (h *peerAPIHandler) handleServeDrive(w http.ResponseWriter, r *http.Request) {
+	if !h.ps.b.DriveSharingEnabled() {
+		h.logf("taildrive: not enabled")
+		http.Error(w, "taildrive not enabled", http.StatusNotFound)
 		return
 	}
 
 	capsMap := h.peerCaps()
-	tailfsCaps, ok := capsMap[tailcfg.PeerCapabilityTailFS]
+	driveCaps, ok := capsMap[tailcfg.PeerCapabilityTaildrive]
 	if !ok {
-		h.logf("tailfs: not permitted")
-		http.Error(w, "tailfs not permitted", http.StatusForbidden)
+		h.logf("taildrive: not permitted")
+		http.Error(w, "taildrive not permitted", http.StatusForbidden)
 		return
 	}
 
-	rawPerms := make([][]byte, 0, len(tailfsCaps))
-	for _, cap := range tailfsCaps {
+	rawPerms := make([][]byte, 0, len(driveCaps))
+	for _, cap := range driveCaps {
 		rawPerms = append(rawPerms, []byte(cap))
 	}
 
-	p, err := tailfs.ParsePermissions(rawPerms)
+	p, err := drive.ParsePermissions(rawPerms)
 	if err != nil {
-		h.logf("tailfs: error parsing permissions: %w", err.Error())
+		h.logf("taildrive: error parsing permissions: %w", err.Error())
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	fs, ok := h.ps.b.sys.TailFSForRemote.GetOK()
+	fs, ok := h.ps.b.sys.DriveForRemote.GetOK()
 	if !ok {
-		h.logf("tailfs: not supported on platform")
-		http.Error(w, "tailfs not supported on platform", http.StatusNotFound)
+		h.logf("taildrive: not supported on platform")
+		http.Error(w, "taildrive not supported on platform", http.StatusNotFound)
 		return
 	}
 	wr := &httpResponseWrapper{
@@ -1193,22 +1193,22 @@ func (h *peerAPIHandler) handleServeTailFS(w http.ResponseWriter, r *http.Reques
 					contentType = ct
 				}
 
-				h.logf("tailfs: share: %s from %s to %s: status-code=%d ext=%q content-type=%q tx=%.f rx=%.f", r.Method, h.peerNode.Key().ShortString(), h.selfNode.Key().ShortString(), wr.statusCode, parseTailFSFileExtensionForLog(r.URL.Path), contentType, roundTraffic(wr.contentLength), roundTraffic(bw.bytesRead))
+				h.logf("taildrive: share: %s from %s to %s: status-code=%d ext=%q content-type=%q tx=%.f rx=%.f", r.Method, h.peerNode.Key().ShortString(), h.selfNode.Key().ShortString(), wr.statusCode, parseDriveFileExtensionForLog(r.URL.Path), contentType, roundTraffic(wr.contentLength), roundTraffic(bw.bytesRead))
 			}
 		}()
 	}
 
-	r.URL.Path = strings.TrimPrefix(r.URL.Path, tailFSPrefix)
+	r.URL.Path = strings.TrimPrefix(r.URL.Path, taildrivePrefix)
 	fs.ServeHTTPWithPerms(p, wr, r)
 }
 
-// parseTailFSFileExtensionForLog parses the file extension, if available.
+// parseDriveFileExtensionForLog parses the file extension, if available.
 // If a file extension is not present or parsable, the file extension is
 // set to "unknown". If the file extension contains a double quote, it is
 // replaced with "removed".
 // All whitespace is removed from a parsed file extension.
 // File extensions including the leading ., e.g. ".gif".
-func parseTailFSFileExtensionForLog(path string) string {
+func parseDriveFileExtensionForLog(path string) string {
 	fileExt := "unknown"
 	if fe := filepath.Ext(path); fe != "" {
 		if strings.Contains(fe, "\"") {

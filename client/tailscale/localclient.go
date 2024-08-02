@@ -28,6 +28,7 @@ import (
 
 	"go4.org/mem"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/drive"
 	"tailscale.com/envknob"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
@@ -35,7 +36,6 @@ import (
 	"tailscale.com/paths"
 	"tailscale.com/safesocket"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tailfs"
 	"tailscale.com/tka"
 	"tailscale.com/types/key"
 	"tailscale.com/types/tkatype"
@@ -103,7 +103,7 @@ func (lc *LocalClient) defaultDialer(ctx context.Context, network, addr string) 
 			return d.DialContext(ctx, "tcp", "127.0.0.1:"+strconv.Itoa(port))
 		}
 	}
-	return safesocket.Connect(lc.socket())
+	return safesocket.ConnectContext(ctx, lc.socket())
 }
 
 // DoLocalRequest makes an HTTP request to the local machine's Tailscale daemon.
@@ -253,9 +253,14 @@ func (lc *LocalClient) sendWithHeaders(
 	}
 	if res.StatusCode != wantStatus {
 		err = fmt.Errorf("%v: %s", res.Status, bytes.TrimSpace(slurp))
-		return nil, nil, bestError(err, slurp)
+		return nil, nil, httpStatusError{bestError(err, slurp), res.StatusCode}
 	}
 	return slurp, res.Header, nil
+}
+
+type httpStatusError struct {
+	error
+	HTTPStatus int
 }
 
 func (lc *LocalClient) get200(ctx context.Context, path string) ([]byte, error) {
@@ -278,9 +283,50 @@ func decodeJSON[T any](b []byte) (ret T, err error) {
 }
 
 // WhoIs returns the owner of the remoteAddr, which must be an IP or IP:port.
+//
+// If not found, the error is ErrPeerNotFound.
+//
+// For connections proxied by tailscaled, this looks up the owner of the given
+// address as TCP first, falling back to UDP; if you want to only check a
+// specific address family, use WhoIsProto.
 func (lc *LocalClient) WhoIs(ctx context.Context, remoteAddr string) (*apitype.WhoIsResponse, error) {
 	body, err := lc.get200(ctx, "/localapi/v0/whois?addr="+url.QueryEscape(remoteAddr))
 	if err != nil {
+		if hs, ok := err.(httpStatusError); ok && hs.HTTPStatus == http.StatusNotFound {
+			return nil, ErrPeerNotFound
+		}
+		return nil, err
+	}
+	return decodeJSON[*apitype.WhoIsResponse](body)
+}
+
+// ErrPeerNotFound is returned by WhoIs and WhoIsNodeKey when a peer is not found.
+var ErrPeerNotFound = errors.New("peer not found")
+
+// WhoIsNodeKey returns the owner of the given wireguard public key.
+//
+// If not found, the error is ErrPeerNotFound.
+func (lc *LocalClient) WhoIsNodeKey(ctx context.Context, key key.NodePublic) (*apitype.WhoIsResponse, error) {
+	body, err := lc.get200(ctx, "/localapi/v0/whois?addr="+url.QueryEscape(key.String()))
+	if err != nil {
+		if hs, ok := err.(httpStatusError); ok && hs.HTTPStatus == http.StatusNotFound {
+			return nil, ErrPeerNotFound
+		}
+		return nil, err
+	}
+	return decodeJSON[*apitype.WhoIsResponse](body)
+}
+
+// WhoIsProto returns the owner of the remoteAddr, which must be an IP or
+// IP:port, for the given protocol (tcp or udp).
+//
+// If not found, the error is ErrPeerNotFound.
+func (lc *LocalClient) WhoIsProto(ctx context.Context, proto, remoteAddr string) (*apitype.WhoIsResponse, error) {
+	body, err := lc.get200(ctx, "/localapi/v0/whois?proto="+url.QueryEscape(proto)+"&addr="+url.QueryEscape(remoteAddr))
+	if err != nil {
+		if hs, ok := err.(httpStatusError); ok && hs.HTTPStatus == http.StatusNotFound {
+			return nil, ErrPeerNotFound
+		}
 		return nil, err
 	}
 	return decodeJSON[*apitype.WhoIsResponse](body)
@@ -699,6 +745,27 @@ func (lc *LocalClient) CheckUDPGROForwarding(ctx context.Context) error {
 	return nil
 }
 
+// SetUDPGROForwarding enables UDP GRO forwarding for the main interface of this
+// node. This can be done to improve performance of tailnet nodes acting as exit
+// nodes or subnet routers.
+// See https://tailscale.com/kb/1320/performance-best-practices#linux-optimizations-for-subnet-routers-and-exit-nodes
+func (lc *LocalClient) SetUDPGROForwarding(ctx context.Context) error {
+	body, err := lc.get200(ctx, "/localapi/v0/set-udp-gro-forwarding")
+	if err != nil {
+		return err
+	}
+	var jres struct {
+		Warning string
+	}
+	if err := json.Unmarshal(body, &jres); err != nil {
+		return fmt.Errorf("invalid JSON from set-udp-gro-forwarding: %w", err)
+	}
+	if jres.Warning != "" {
+		return errors.New(jres.Warning)
+	}
+	return nil
+}
+
 // CheckPrefs validates the provided preferences, without making any changes.
 //
 // The CLI uses this before a Start call to fail fast if the preferences won't
@@ -778,6 +845,17 @@ func (lc *LocalClient) SetDNS(ctx context.Context, name, value string) error {
 //
 // The ctx is only used for the duration of the call, not the lifetime of the net.Conn.
 func (lc *LocalClient) DialTCP(ctx context.Context, host string, port uint16) (net.Conn, error) {
+	return lc.UserDial(ctx, "tcp", host, port)
+}
+
+// UserDial connects to the host's port via Tailscale for the given network.
+//
+// The host may be a base DNS name (resolved from the netmap inside tailscaled),
+// a FQDN, or an IP address.
+//
+// The ctx is only used for the duration of the call, not the lifetime of the
+// net.Conn.
+func (lc *LocalClient) UserDial(ctx context.Context, network, host string, port uint16) (net.Conn, error) {
 	connCh := make(chan net.Conn, 1)
 	trace := httptrace.ClientTrace{
 		GotConn: func(info httptrace.GotConnInfo) {
@@ -790,10 +868,11 @@ func (lc *LocalClient) DialTCP(ctx context.Context, host string, port uint16) (n
 		return nil, err
 	}
 	req.Header = http.Header{
-		"Upgrade":    []string{"ts-dial"},
-		"Connection": []string{"upgrade"},
-		"Dial-Host":  []string{host},
-		"Dial-Port":  []string{fmt.Sprint(port)},
+		"Upgrade":      []string{"ts-dial"},
+		"Connection":   []string{"upgrade"},
+		"Dial-Host":    []string{host},
+		"Dial-Port":    []string{fmt.Sprint(port)},
+		"Dial-Network": []string{network},
 	}
 	res, err := lc.DoLocalRequest(req)
 	if err != nil {
@@ -854,7 +933,20 @@ func CertPair(ctx context.Context, domain string) (certPEM, keyPEM []byte, err e
 //
 // API maturity: this is considered a stable API.
 func (lc *LocalClient) CertPair(ctx context.Context, domain string) (certPEM, keyPEM []byte, err error) {
-	res, err := lc.send(ctx, "GET", "/localapi/v0/cert/"+domain+"?type=pair", 200, nil)
+	return lc.CertPairWithValidity(ctx, domain, 0)
+}
+
+// CertPairWithValidity returns a cert and private key for the provided DNS
+// domain.
+//
+// It returns a cached certificate from disk if it's still valid.
+// When minValidity is non-zero, the returned certificate will be valid for at
+// least the given duration, if permitted by the CA. If the certificate is
+// valid, but for less than minValidity, it will be synchronously renewed.
+//
+// API maturity: this is considered a stable API.
+func (lc *LocalClient) CertPairWithValidity(ctx context.Context, domain string, minValidity time.Duration) (certPEM, keyPEM []byte, err error) {
+	res, err := lc.send(ctx, "GET", fmt.Sprintf("/localapi/v0/cert/%s?type=pair&min_validity=%s", domain, minValidity), 200, nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1418,53 +1510,62 @@ func (lc *LocalClient) CheckUpdate(ctx context.Context) (*tailcfg.ClientVersion,
 	return &cv, nil
 }
 
-// TailFSSetFileServerAddr instructs TailFS to use the server at addr to access
+// SetUseExitNode toggles the use of an exit node on or off.
+// To turn it on, there must have been a previously used exit node.
+// The most previously used one is reused.
+// This is a convenience method for GUIs. To select an actual one, update the prefs.
+func (lc *LocalClient) SetUseExitNode(ctx context.Context, on bool) error {
+	_, err := lc.send(ctx, "POST", "/localapi/v0/set-use-exit-node-enabled?enabled="+strconv.FormatBool(on), http.StatusOK, nil)
+	return err
+}
+
+// DriveSetServerAddr instructs Taildrive to use the server at addr to access
 // the filesystem. This is used on platforms like Windows and MacOS to let
-// TailFS know to use the file server running in the GUI app.
-func (lc *LocalClient) TailFSSetFileServerAddr(ctx context.Context, addr string) error {
-	_, err := lc.send(ctx, "PUT", "/localapi/v0/tailfs/fileserver-address", http.StatusCreated, strings.NewReader(addr))
+// Taildrive know to use the file server running in the GUI app.
+func (lc *LocalClient) DriveSetServerAddr(ctx context.Context, addr string) error {
+	_, err := lc.send(ctx, "PUT", "/localapi/v0/drive/fileserver-address", http.StatusCreated, strings.NewReader(addr))
 	return err
 }
 
-// TailFSShareSet adds or updates the given share in the list of shares that
-// TailFS will serve to remote nodes. If a share with the same name already
+// DriveShareSet adds or updates the given share in the list of shares that
+// Taildrive will serve to remote nodes. If a share with the same name already
 // exists, the existing share is replaced/updated.
-func (lc *LocalClient) TailFSShareSet(ctx context.Context, share *tailfs.Share) error {
-	_, err := lc.send(ctx, "PUT", "/localapi/v0/tailfs/shares", http.StatusCreated, jsonBody(share))
+func (lc *LocalClient) DriveShareSet(ctx context.Context, share *drive.Share) error {
+	_, err := lc.send(ctx, "PUT", "/localapi/v0/drive/shares", http.StatusCreated, jsonBody(share))
 	return err
 }
 
-// TailFSShareRemove removes the share with the given name from the list of
-// shares that TailFS will serve to remote nodes.
-func (lc *LocalClient) TailFSShareRemove(ctx context.Context, name string) error {
+// DriveShareRemove removes the share with the given name from the list of
+// shares that Taildrive will serve to remote nodes.
+func (lc *LocalClient) DriveShareRemove(ctx context.Context, name string) error {
 	_, err := lc.send(
 		ctx,
 		"DELETE",
-		"/localapi/v0/tailfs/shares",
+		"/localapi/v0/drive/shares",
 		http.StatusNoContent,
 		strings.NewReader(name))
 	return err
 }
 
-// TailFSShareRename renames the share from old to new name.
-func (lc *LocalClient) TailFSShareRename(ctx context.Context, oldName, newName string) error {
+// DriveShareRename renames the share from old to new name.
+func (lc *LocalClient) DriveShareRename(ctx context.Context, oldName, newName string) error {
 	_, err := lc.send(
 		ctx,
 		"POST",
-		"/localapi/v0/tailfs/shares",
+		"/localapi/v0/drive/shares",
 		http.StatusNoContent,
 		jsonBody([2]string{oldName, newName}))
 	return err
 }
 
-// TailFSShareList returns the list of shares that TailFS is currently serving
+// DriveShareList returns the list of shares that drive is currently serving
 // to remote nodes.
-func (lc *LocalClient) TailFSShareList(ctx context.Context) ([]*tailfs.Share, error) {
-	result, err := lc.get200(ctx, "/localapi/v0/tailfs/shares")
+func (lc *LocalClient) DriveShareList(ctx context.Context) ([]*drive.Share, error) {
+	result, err := lc.get200(ctx, "/localapi/v0/drive/shares")
 	if err != nil {
 		return nil, err
 	}
-	var shares []*tailfs.Share
+	var shares []*drive.Share
 	err = json.Unmarshal(result, &shares)
 	return shares, err
 }
@@ -1504,4 +1605,13 @@ func (w *IPNBusWatcher) Next() (ipn.Notify, error) {
 		return ipn.Notify{}, err
 	}
 	return n, nil
+}
+
+// SuggestExitNode requests an exit node suggestion and returns the exit node's details.
+func (lc *LocalClient) SuggestExitNode(ctx context.Context) (apitype.ExitNodeSuggestionResponse, error) {
+	body, err := lc.get200(ctx, "/localapi/v0/suggest-exit-node")
+	if err != nil {
+		return apitype.ExitNodeSuggestionResponse{}, err
+	}
+	return decodeJSON[apitype.ExitNodeSuggestionResponse](body)
 }

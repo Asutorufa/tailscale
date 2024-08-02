@@ -22,9 +22,7 @@ func init() {
 	distroName = distroNameLinux
 	distroVersion = distroVersionLinux
 	distroCodeName = distroCodeNameLinux
-	if v := linuxDeviceModel(); v != "" {
-		SetDeviceModel(v)
-	}
+	deviceModel = deviceModelLinux
 }
 
 var (
@@ -50,7 +48,7 @@ func distroCodeNameLinux() string {
 	return lazyVersionMeta.Get().DistroCodeName
 }
 
-func linuxDeviceModel() string {
+func deviceModelLinux() string {
 	for _, path := range []string{
 		// First try the Synology-specific location.
 		// Example: "DS916+-j"
@@ -161,7 +159,14 @@ func linuxVersionMeta() (meta versionMeta) {
 	return
 }
 
+// linuxBuildTagPackageType is set by packagetype_*.go
+// build tag guarded files.
+var linuxBuildTagPackageType string
+
 func packageTypeLinux() string {
+	if v := linuxBuildTagPackageType; v != "" {
+		return v
+	}
 	// Report whether this is in a snap.
 	// See https://snapcraft.io/docs/environment-variables
 	// We just look at two somewhat arbitrarily.

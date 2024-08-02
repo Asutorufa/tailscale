@@ -33,7 +33,9 @@ import (
 	"tailscale.com/client/tailscale"
 	"tailscale.com/cmd/tailscaled/childproc"
 	"tailscale.com/control/controlclient"
+	"tailscale.com/drive/driveimpl"
 	"tailscale.com/envknob"
+	"tailscale.com/ipn"
 	"tailscale.com/ipn/conffile"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/ipnserver"
@@ -52,7 +54,6 @@ import (
 	"tailscale.com/paths"
 	"tailscale.com/safesocket"
 	"tailscale.com/syncs"
-	"tailscale.com/tailfs/tailfsimpl"
 	"tailscale.com/tsd"
 	"tailscale.com/tsweb/varz"
 	"tailscale.com/types/flagtype"
@@ -79,7 +80,7 @@ func defaultTunName() string {
 		// "utun" is recognized by wireguard-go/tun/tun_darwin.go
 		// as a magic value that uses/creates any free number.
 		return "utun"
-	case "plan9":
+	case "plan9", "aix":
 		return "userspace-networking"
 	case "linux":
 		switch distro.Get() {
@@ -116,8 +117,8 @@ var args struct {
 	// or comma-separated list thereof.
 	tunname string
 
-	cleanup        bool
-	confFile       string
+	cleanUp        bool
+	confFile       string // empty, file path, or "vm:user-data"
 	debug          string
 	port           uint16
 	statepath      string
@@ -145,7 +146,7 @@ var subCommands = map[string]*func([]string) error{
 	"uninstall-system-daemon": &uninstallSystemDaemon,
 	"debug":                   &debugModeFunc,
 	"be-child":                &beChildFunc,
-	"serve-tailfs":            &serveTailFSFunc,
+	"serve-taildrive":         &serveDriveFunc,
 }
 
 var beCLI func() // non-nil if CLI is linked in
@@ -156,7 +157,7 @@ func main() {
 
 	printVersion := false
 	flag.IntVar(&args.verbose, "verbose", 0, "log verbosity level; 0 is default, 1 or higher are increasingly verbose")
-	flag.BoolVar(&args.cleanup, "cleanup", false, "clean up system state and exit")
+	flag.BoolVar(&args.cleanUp, "cleanup", false, "clean up system state and exit")
 	flag.StringVar(&args.debug, "debug", "", "listen address ([ip]:port) of optional debug server")
 	flag.StringVar(&args.socksAddr, "socks5-server", "", `optional [ip]:port to run a SOCK5 server (e.g. "localhost:1080")`)
 	flag.StringVar(&args.httpProxyAddr, "outbound-http-proxy-listen", "", `optional [ip]:port to run an outbound HTTP proxy (e.g. "localhost:8080")`)
@@ -168,7 +169,7 @@ func main() {
 	flag.StringVar(&args.birdSocketPath, "bird-socket", "", "path of the bird unix socket")
 	flag.BoolVar(&printVersion, "version", false, "print version information and exit")
 	flag.BoolVar(&args.disableLogs, "no-logs-no-support", false, "disable log uploads; this also disables any technical support")
-	flag.StringVar(&args.confFile, "config", "", "path to config file")
+	flag.StringVar(&args.confFile, "config", "", "path to config file, or 'vm:user-data' to use the VM's user-data (EC2)")
 
 	if len(os.Args) > 0 && filepath.Base(os.Args[0]) == "tailscale" && beCLI != nil {
 		beCLI()
@@ -207,7 +208,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	if runtime.GOOS == "darwin" && os.Getuid() != 0 && !strings.Contains(args.tunname, "userspace-networking") && !args.cleanup {
+	if runtime.GOOS == "darwin" && os.Getuid() != 0 && !strings.Contains(args.tunname, "userspace-networking") && !args.cleanUp {
 		log.SetFlags(0)
 		log.Fatalf("tailscaled requires root; use sudo tailscaled (or use --tun=userspace-networking)")
 	}
@@ -358,7 +359,7 @@ func run() (err error) {
 		sys.Set(netMon)
 	}
 
-	pol := logpolicy.New(logtail.CollectionNode, netMon, nil /* use log.Printf */)
+	pol := logpolicy.New(logtail.CollectionNode, netMon, sys.HealthTracker(), nil /* use log.Printf */)
 	pol.SetVerbosityLevel(args.verbose)
 	logPol = pol
 	defer func() {
@@ -387,12 +388,16 @@ func run() (err error) {
 	}
 	logf = logger.RateLimitedFn(logf, 5*time.Second, 5, 100)
 
-	if args.cleanup {
-		if envknob.Bool("TS_PLEASE_PANIC") {
-			panic("TS_PLEASE_PANIC asked us to panic")
-		}
-		dns.Cleanup(logf, args.tunname)
-		router.Cleanup(logf, args.tunname)
+	if envknob.Bool("TS_PLEASE_PANIC") {
+		panic("TS_PLEASE_PANIC asked us to panic")
+	}
+	// Always clean up, even if we're going to run the server. This covers cases
+	// such as when a system was rebooted without shutting down, or tailscaled
+	// crashed, and would for example restore system DNS configuration.
+	dns.CleanUp(logf, netMon, sys.HealthTracker(), args.tunname)
+	router.CleanUp(logf, netMon, args.tunname)
+	// If the cleanUp flag was passed, then exit.
+	if args.cleanUp {
 		return nil
 	}
 
@@ -407,7 +412,7 @@ func run() (err error) {
 		debugMux = newDebugMux()
 	}
 
-	sys.Set(tailfsimpl.NewFileSystemForRemote(logf))
+	sys.Set(driveimpl.NewFileSystemForRemote(logf))
 
 	return startIPNServer(context.Background(), logf, pol.PublicID, sys)
 }
@@ -476,6 +481,15 @@ func startIPNServer(ctx context.Context, logf logger.Logf, logID logid.PublicID,
 		lb, err := getLocalBackend(ctx, logf, logID, sys)
 		if err == nil {
 			logf("got LocalBackend in %v", time.Since(t0).Round(time.Millisecond))
+			if lb.Prefs().Valid() {
+				if err := lb.Start(ipn.Options{}); err != nil {
+					logf("LocalBackend.Start: %v", err)
+					lb.Shutdown()
+					lbErr.Store(err)
+					cancel()
+					return
+				}
+			}
 			srv.SetLocalBackend(lb)
 			close(wgEngineCreated)
 			return
@@ -534,13 +548,24 @@ func getLocalBackend(ctx context.Context, logf logger.Logf, logID logid.PublicID
 			return ok
 		}
 		dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
-			// Note: don't just return ns.DialContextTCP or we'll
-			// return an interface containing a nil pointer.
+			// Note: don't just return ns.DialContextTCP or we'll return
+			// *gonet.TCPConn(nil) instead of a nil interface which trips up
+			// callers.
 			tcpConn, err := ns.DialContextTCP(ctx, dst)
 			if err != nil {
 				return nil, err
 			}
 			return tcpConn, nil
+		}
+		dialer.NetstackDialUDP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+			// Note: don't just return ns.DialContextUDP or we'll return
+			// *gonet.UDPConn(nil) instead of a nil interface which trips up
+			// callers.
+			udpConn, err := ns.DialContextUDP(ctx, dst)
+			if err != nil {
+				return nil, err
+			}
+			return udpConn, nil
 		}
 	}
 	if socksListener != nil || httpProxyListener != nil {
@@ -645,12 +670,13 @@ var tstunNew = tstun.New
 
 func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack bool, err error) {
 	conf := wgengine.Config{
-		ListenPort:     args.port,
-		NetMon:         sys.NetMon.Get(),
-		Dialer:         sys.Dialer.Get(),
-		SetSubsystem:   sys.Set,
-		ControlKnobs:   sys.ControlKnobs(),
-		TailFSForLocal: tailfsimpl.NewFileSystemForLocal(logf),
+		ListenPort:    args.port,
+		NetMon:        sys.NetMon.Get(),
+		HealthTracker: sys.HealthTracker(),
+		Dialer:        sys.Dialer.Get(),
+		SetSubsystem:  sys.Set,
+		ControlKnobs:  sys.ControlKnobs(),
+		DriveForLocal: driveimpl.NewFileSystemForLocal(logf),
 	}
 
 	onlyNetstack = name == "userspace-networking"
@@ -672,7 +698,7 @@ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack boo
 			// configuration being unavailable (from the noop
 			// manager). More in Issue 4017.
 			// TODO(bradfitz): add a Synology-specific DNS manager.
-			conf.DNS, err = dns.NewOSConfigurator(logf, "") // empty interface name
+			conf.DNS, err = dns.NewOSConfigurator(logf, sys.HealthTracker(), sys.ControlKnobs(), "") // empty interface name
 			if err != nil {
 				return false, fmt.Errorf("dns.NewOSConfigurator: %w", err)
 			}
@@ -694,13 +720,13 @@ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack boo
 			return false, err
 		}
 
-		r, err := router.New(logf, dev, sys.NetMon.Get())
+		r, err := router.New(logf, dev, sys.NetMon.Get(), sys.HealthTracker())
 		if err != nil {
 			dev.Close()
 			return false, fmt.Errorf("creating router: %w", err)
 		}
 
-		d, err := dns.NewOSConfigurator(logf, devName)
+		d, err := dns.NewOSConfigurator(logf, sys.HealthTracker(), sys.ControlKnobs(), devName)
 		if err != nil {
 			dev.Close()
 			r.Close()
@@ -709,7 +735,6 @@ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack boo
 		conf.DNS = d
 		conf.Router = r
 		if handleSubnetsInNetstack() {
-			conf.Router = netstack.NewSubnetRouterWrapper(conf.Router)
 			netstackSubnetRouter = true
 		}
 		sys.Set(conf.Router)
@@ -753,7 +778,7 @@ func runDebugServer(mux *http.ServeMux, addr string) {
 }
 
 func newNetstack(logf logger.Logf, sys *tsd.System) (*netstack.Impl, error) {
-	tfs, _ := sys.TailFSForLocal.GetOK()
+	tfs, _ := sys.DriveForLocal.GetOK()
 	ret, err := netstack.Create(logf,
 		sys.Tun.Get(),
 		sys.Engine.Get(),
@@ -831,25 +856,25 @@ func beChild(args []string) error {
 	return f(args[1:])
 }
 
-var serveTailFSFunc = serveTailFS
+var serveDriveFunc = serveDrive
 
-// serveTailFS serves one or more tailfs on localhost using the WebDAV
-// protocol. On UNIX and MacOS tailscaled environment, tailfs spawns child
-// tailscaled processes in serve-tailfs mode in order to access the fliesystem
+// serveDrive serves one or more Taildrives on localhost using the WebDAV
+// protocol. On UNIX and MacOS tailscaled environment, Taildrive spawns child
+// tailscaled processes in serve-taildrive mode in order to access the fliesystem
 // as specific (usually unprivileged) users.
 //
-// serveTailFS prints the address on which it's listening to stdout so that the
+// serveDrive prints the address on which it's listening to stdout so that the
 // parent process knows where to connect to.
-func serveTailFS(args []string) error {
+func serveDrive(args []string) error {
 	if len(args) == 0 {
 		return errors.New("missing shares")
 	}
 	if len(args)%2 != 0 {
 		return errors.New("need <sharename> <path> pairs")
 	}
-	s, err := tailfsimpl.NewFileServer()
+	s, err := driveimpl.NewFileServer()
 	if err != nil {
-		return fmt.Errorf("unable to start tailfs FileServer: %v", err)
+		return fmt.Errorf("unable to start Taildrive file server: %v", err)
 	}
 	shares := make(map[string]string)
 	for i := 0; i < len(args); i += 2 {

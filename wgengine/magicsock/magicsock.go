@@ -7,17 +7,20 @@ package magicsock
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/tailscale/wireguard-go/conn"
@@ -32,7 +35,6 @@ import (
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/connstats"
-	"tailscale.com/net/interfaces"
 	"tailscale.com/net/netcheck"
 	"tailscale.com/net/neterror"
 	"tailscale.com/net/netmon"
@@ -89,7 +91,8 @@ type Conn struct {
 	idleFunc               func() time.Duration // nil means unknown
 	testOnlyPacketListener nettype.PacketListener
 	noteRecvActivity       func(key.NodePublic) // or nil, see Options.NoteRecvActivity
-	netMon                 *netmon.Monitor      // or nil
+	netMon                 *netmon.Monitor      // must be non-nil
+	health                 *health.Tracker      // or nil
 	controlKnobs           *controlknobs.Knobs  // or nil
 
 	// ================================================================
@@ -305,6 +308,16 @@ type Conn struct {
 	// getPeerByKey optionally specifies a function to look up a peer's
 	// wireguard state by its public key. If nil, it's not used.
 	getPeerByKey func(key.NodePublic) (_ wgint.Peer, ok bool)
+
+	// lastEPERMRebind tracks the last time a rebind was performed
+	// after experiencing a syscall.EPERM.
+	lastEPERMRebind syncs.AtomicValue[time.Time]
+
+	// staticEndpoints are user set endpoints that this node should
+	// advertise amongst its wireguard endpoints. It is user's
+	// responsibility to ensure that traffic from these endpoints is routed
+	// to the node.
+	staticEndpoints views.Slice[netip.AddrPort]
 }
 
 // SetDebugLoggingEnabled controls whether spammy debug logging is enabled.
@@ -364,8 +377,12 @@ type Options struct {
 	NoteRecvActivity func(key.NodePublic)
 
 	// NetMon is the network monitor to use.
-	// With one, the portmapper won't be used.
+	// It must be non-nil.
 	NetMon *netmon.Monitor
+
+	// HealthTracker optionally specifies the health tracker to
+	// report errors and warnings to.
+	HealthTracker *health.Tracker
 
 	// ControlKnobs are the set of control knobs to use.
 	// If nil, they're ignored and not updated.
@@ -379,6 +396,10 @@ type Options struct {
 	// WireGuard state by its public key. If nil, it's not used.
 	// In regular use, this will be wgengine.(*userspaceEngine).PeerByKey.
 	PeerByKeyFunc func(key.NodePublic) (_ wgint.Peer, ok bool)
+
+	// DisablePortMapper, if true, disables the portmapper.
+	// This is primarily useful in tests.
+	DisablePortMapper bool
 }
 
 func (o *Options) logf() logger.Logf {
@@ -437,6 +458,10 @@ func newConn() *Conn {
 // As the set of possible endpoints for a Conn changes, the
 // callback opts.EndpointsFunc is called.
 func NewConn(opts Options) (*Conn, error) {
+	if opts.NetMon == nil {
+		return nil, errors.New("magicsock.Options.NetMon must be non-nil")
+	}
+
 	c := newConn()
 	c.port.Store(uint32(opts.Port))
 	c.controlKnobs = opts.ControlKnobs
@@ -447,13 +472,12 @@ func NewConn(opts Options) (*Conn, error) {
 	c.testOnlyPacketListener = opts.TestOnlyPacketListener
 	c.noteRecvActivity = opts.NoteRecvActivity
 	portMapOpts := &portmapper.DebugKnobs{
-		DisableAll: func() bool { return c.onlyTCP443.Load() },
+		DisableAll: func() bool { return opts.DisablePortMapper || c.onlyTCP443.Load() },
 	}
 	c.portMapper = portmapper.NewClient(logger.WithPrefix(c.logf, "portmapper: "), opts.NetMon, portMapOpts, opts.ControlKnobs, c.onPortMapChanged)
-	if opts.NetMon != nil {
-		c.portMapper.SetGatewayLookupFunc(opts.NetMon.GatewayAndSelfIP)
-	}
+	c.portMapper.SetGatewayLookupFunc(opts.NetMon.GatewayAndSelfIP)
 	c.netMon = opts.NetMon
+	c.health = opts.HealthTracker
 	c.onPortUpdate = opts.OnPortUpdate
 	c.getPeerByKey = opts.PeerByKeyFunc
 
@@ -619,6 +643,22 @@ func (c *Conn) setEndpoints(endpoints []tailcfg.Endpoint) (changed bool) {
 	return true
 }
 
+// SetStaticEndpoints sets static endpoints to the provided value and triggers
+// an asynchronous update of the endpoints that this node advertises.
+// Static endpoints are endpoints explicitly configured by user.
+func (c *Conn) SetStaticEndpoints(ep views.Slice[netip.AddrPort]) {
+	c.mu.Lock()
+	if reflect.DeepEqual(c.staticEndpoints.AsSlice(), ep.AsSlice()) {
+		return
+	}
+	c.staticEndpoints = ep
+	c.mu.Unlock()
+	// Technically this is not a reSTUNning, but ReSTUN does what we need at
+	// this point- calls updateEndpoints or queues an update if there is
+	// already an in-progress update.
+	c.ReSTUN("static-endpoint-change")
+}
+
 // setNetInfoHavePortMap updates NetInfo.HavePortMap to true.
 func (c *Conn) setNetInfoHavePortMap() {
 	c.mu.Lock()
@@ -657,7 +697,7 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 		// NOTE(andrew-d): I don't love that we're depending on the
 		// health package here, but I'd rather do that and not store
 		// the exact same state in two different places.
-		GetLastDERPActivity: health.GetDERPRegionReceivedTime,
+		GetLastDERPActivity: c.health.GetDERPRegionReceivedTime,
 	})
 	if err != nil {
 		return nil, err
@@ -671,7 +711,6 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 	ni := &tailcfg.NetInfo{
 		DERPLatency:           map[string]float64{},
 		MappingVariesByDestIP: report.MappingVariesByDestIP,
-		HairPinning:           report.HairPinning,
 		UPnP:                  report.UPnP,
 		PMP:                   report.PMP,
 		PCP:                   report.PCP,
@@ -829,8 +868,10 @@ func (c *Conn) DiscoPublicKey() key.DiscoPublic {
 	return c.discoPublic
 }
 
-// determineEndpoints returns the machine's endpoint addresses. It
-// does a STUN lookup (via netcheck) to determine its public address.
+// determineEndpoints returns the machine's endpoint addresses. It does a STUN
+// lookup (via netcheck) to determine its public address. Additionally any
+// static enpoints provided by user are always added to the returned endpoints
+// without validating if the node can be reached via those endpoints.
 //
 // c.mu must NOT be held.
 func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, error) {
@@ -884,22 +925,31 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
 		c.setNetInfoHavePortMap()
 	}
 
-	if nr.GlobalV4 != "" {
-		addAddr(ipp(nr.GlobalV4), tailcfg.EndpointSTUN)
+	v4Addrs, v6Addrs := nr.GetGlobalAddrs()
+	for _, addr := range v4Addrs {
+		addAddr(addr, tailcfg.EndpointSTUN)
+	}
+	for _, addr := range v6Addrs {
+		addAddr(addr, tailcfg.EndpointSTUN)
+	}
 
+	if len(v4Addrs) >= 1 {
 		// If they're behind a hard NAT and are using a fixed
 		// port locally, assume they might've added a static
 		// port mapping on their router to the same explicit
 		// port that tailscaled is running with. Worst case
 		// it's an invalid candidate mapping.
 		if port := c.port.Load(); nr.MappingVariesByDestIP.EqualBool(true) && port != 0 {
-			if ip, _, err := net.SplitHostPort(nr.GlobalV4); err == nil {
-				addAddr(ipp(net.JoinHostPort(ip, strconv.Itoa(int(port)))), tailcfg.EndpointSTUN4LocalPort)
-			}
+			addAddr(netip.AddrPortFrom(v4Addrs[0].Addr(), uint16(port)), tailcfg.EndpointSTUN4LocalPort)
 		}
 	}
-	if nr.GlobalV6 != "" {
-		addAddr(ipp(nr.GlobalV6), tailcfg.EndpointSTUN)
+
+	// Temporarily (2024-07-08) during investigations, allow setting
+	// pretend endpoint(s) for testing NAT traversal scenarios.
+	// TODO(bradfitz): probably promote this to the config file.
+	// https://github.com/tailscale/tailscale/issues/12578
+	for _, ap := range pretendpoints() {
+		addAddr(ap, tailcfg.EndpointExplicitConf)
 	}
 
 	// Update our set of endpoints by adding any endpoints that we
@@ -918,8 +968,12 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
 	// re-run.
 	eps = c.endpointTracker.update(time.Now(), eps)
 
+	for i := range c.staticEndpoints.Len() {
+		addAddr(c.staticEndpoints.At(i), tailcfg.EndpointExplicitConf)
+	}
+
 	if localAddr := c.pconn4.LocalAddr(); localAddr.IP.IsUnspecified() {
-		ips, loopback, err := interfaces.LocalAddresses()
+		ips, loopback, err := netmon.LocalAddresses()
 		if err != nil {
 			return nil, err
 		}
@@ -1047,6 +1101,8 @@ func (c *Conn) sendUDPBatch(addr netip.AddrPort, buffs [][]byte) (sent bool, err
 		if errors.As(err, &errGSO) {
 			c.logf("magicsock: %s", errGSO.Error())
 			err = errGSO.RetryErr
+		} else {
+			_ = c.maybeRebindOnError(runtime.GOOS, err)
 		}
 	}
 	return err == nil, err
@@ -1061,12 +1117,41 @@ func (c *Conn) sendUDP(ipp netip.AddrPort, b []byte) (sent bool, err error) {
 	sent, err = c.sendUDPStd(ipp, b)
 	if err != nil {
 		metricSendUDPError.Add(1)
+		_ = c.maybeRebindOnError(runtime.GOOS, err)
 	} else {
 		if sent {
 			metricSendUDP.Add(1)
 		}
 	}
 	return
+}
+
+// maybeRebindOnError performs a rebind and restun if the error is defined and
+// any conditionals are met.
+func (c *Conn) maybeRebindOnError(os string, err error) bool {
+	switch err {
+	case syscall.EPERM:
+		why := "operation-not-permitted-rebind"
+		switch os {
+		// We currently will only rebind and restun on a syscall.EPERM if it is experienced
+		// on a client running darwin.
+		// TODO(charlotte, raggi): expand os options if required.
+		case "darwin":
+			// TODO(charlotte): implement a backoff, so we don't end up in a rebind loop for persistent
+			// EPERMs.
+			if c.lastEPERMRebind.Load().Before(time.Now().Add(-5 * time.Second)) {
+				c.logf("magicsock: performing %q", why)
+				c.lastEPERMRebind.Store(time.Now())
+				c.Rebind()
+				go c.ReSTUN(why)
+				return true
+			}
+		default:
+			c.logf("magicsock: not performing %q", why)
+			return false
+		}
+	}
+	return false
 }
 
 // sendUDP sends UDP packet b to addr.
@@ -1107,7 +1192,8 @@ func (c *Conn) sendAddr(addr netip.AddrPort, pubKey key.NodePublic, b []byte) (s
 		return c.sendUDP(addr, b)
 	}
 
-	ch := c.derpWriteChanOfAddr(addr, pubKey)
+	regionID := int(addr.Port())
+	ch := c.derpWriteChanForRegion(regionID, pubKey)
 	if ch == nil {
 		metricSendDERPErrorChan.Add(1)
 		return false, nil
@@ -1118,8 +1204,7 @@ func (c *Conn) sendAddr(addr netip.AddrPort, pubKey key.NodePublic, b []byte) (s
 	// to derpWriteRequest and waited for derphttp.Client.Send to
 	// complete, but that's too slow while holding wireguard-go
 	// internal locks.
-	pkt := make([]byte, len(b))
-	copy(pkt, b)
+	pkt := bytes.Clone(b)
 
 	select {
 	case <-c.donec:
@@ -1157,12 +1242,12 @@ func (c *Conn) putReceiveBatch(batch *receiveBatch) {
 
 // receiveIPv4 creates an IPv4 ReceiveFunc reading from c.pconn4.
 func (c *Conn) receiveIPv4() conn.ReceiveFunc {
-	return c.mkReceiveFunc(&c.pconn4, &health.ReceiveIPv4, metricRecvDataIPv4)
+	return c.mkReceiveFunc(&c.pconn4, c.health.ReceiveFuncStats(health.ReceiveIPv4), metricRecvDataIPv4)
 }
 
 // receiveIPv6 creates an IPv6 ReceiveFunc reading from c.pconn6.
 func (c *Conn) receiveIPv6() conn.ReceiveFunc {
-	return c.mkReceiveFunc(&c.pconn6, &health.ReceiveIPv6, metricRecvDataIPv6)
+	return c.mkReceiveFunc(&c.pconn6, c.health.ReceiveFuncStats(health.ReceiveIPv6), metricRecvDataIPv6)
 }
 
 // mkReceiveFunc creates a ReceiveFunc reading from ruc.
@@ -1220,7 +1305,8 @@ func (c *Conn) mkReceiveFunc(ruc *RebindingUDPConn, healthItem *health.ReceiveFu
 //
 // ok is whether this read should be reported up to wireguard-go (our
 // caller).
-func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *ippEndpointCache) (ep *endpoint, ok bool) {
+func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *ippEndpointCache) (_ conn.Endpoint, ok bool) {
+	var ep *endpoint
 	if stun.Is(b) {
 		c.netChecker.ReceiveSTUNPacket(b, ipp)
 		return nil, false
@@ -1241,7 +1327,10 @@ func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *ippEndpointCache) 
 		de, ok := c.peerMap.endpointForIPPort(ipp)
 		c.mu.Unlock()
 		if !ok {
-			return nil, false
+			if c.controlKnobs != nil && c.controlKnobs.DisableCryptorouting.Load() {
+				return nil, false
+			}
+			return &lazyEndpoint{c: c, src: ipp}, true
 		}
 		cache.ipp = ipp
 		cache.de = de
@@ -1389,10 +1478,10 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netip.AddrPort, derpNodeSrc ke
 		return
 	}
 
-	if !c.peerMap.anyEndpointForDiscoKey(sender) {
+	if !c.peerMap.knownPeerDiscoKey(sender) {
 		metricRecvDiscoBadPeer.Add(1)
 		if debugDisco() {
-			c.logf("magicsock: disco: ignoring disco-looking frame, don't know endpoint for %v", sender.ShortString())
+			c.logf("magicsock: disco: ignoring disco-looking frame, don't know of key %v", sender.ShortString())
 		}
 		return
 	}
@@ -2050,7 +2139,7 @@ func (c *Conn) SetNetworkMap(nm *netmap.NetworkMap) {
 
 	// discokeys might have changed in the above. Discard unused info.
 	for dk := range c.discoInfo {
-		if !c.peerMap.anyEndpointForDiscoKey(dk) {
+		if !c.peerMap.knownPeerDiscoKey(dk) {
 			delete(c.discoInfo, dk)
 		}
 	}
@@ -2299,6 +2388,8 @@ func (c *Conn) onPortMapChanged() { c.ReSTUN("portmap-changed") }
 
 // ReSTUN triggers an address discovery.
 // The provided why string is for debug logging only.
+// If Conn.staticEndpoints have been updated, calling ReSTUN will also result in
+// the new endpoints being advertised.
 func (c *Conn) ReSTUN(why string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -2431,7 +2522,7 @@ func (c *Conn) bindSocket(ruc *RebindingUDPConn, network string, curPortFate cur
 		}
 		ruc.setConnLocked(pconn, network, c.bind.BatchSize())
 		if network == "udp4" {
-			health.SetUDP4Unbound(false)
+			c.health.SetUDP4Unbound(false)
 		}
 		return nil
 	}
@@ -2442,7 +2533,7 @@ func (c *Conn) bindSocket(ruc *RebindingUDPConn, network string, curPortFate cur
 	// we get a link change and we can try binding again.
 	ruc.setConnLocked(newBlockForeverConn(), "", c.bind.BatchSize())
 	if network == "udp4" {
-		health.SetUDP4Unbound(true)
+		c.health.SetUDP4Unbound(true)
 	}
 	return fmt.Errorf("failed to bind any ports (tried %v)", ports)
 }
@@ -2981,6 +3072,17 @@ var (
 	// changed from non-zero to a different non-zero.
 	metricDERPHomeChange = clientmetric.NewCounter("derp_home_change")
 
+	// metricDERPHomeNoChangeNoControl is how many times our DERP home
+	// region did not change because we didn't have an active connection to
+	// the control server.
+	metricDERPHomeNoChangeNoControl = clientmetric.NewCounter("derp_home_no_change_no_control")
+
+	// metricDERPHomeFallback is how many times we picked a DERP fallback.
+	metricDERPHomeFallback = clientmetric.NewCounter("derp_home_fallback")
+
+	// metricDERPStaleCleaned is how many times we closed a stale DERP connection.
+	metricDERPStaleCleaned = clientmetric.NewCounter("derp_stale_cleaned")
+
 	// Disco packets received bpf read path
 	//lint:ignore U1000 used on Linux only
 	metricRecvDiscoPacketIPv4 = clientmetric.NewCounter("magicsock_disco_recv_bpf_ipv4")
@@ -3026,4 +3128,56 @@ func getPeerMTUsProbedMetric(mtu tstun.WireMTU) *clientmetric.Metric {
 	key := fmt.Sprintf("magicsock_recv_disco_peer_mtu_probes_by_mtu_%d", mtu)
 	mm, _ := metricRecvDiscoPeerMTUProbesByMTU.LoadOrInit(key, func() *clientmetric.Metric { return clientmetric.NewCounter(key) })
 	return mm
+}
+
+// GetLastNetcheckReport returns the last netcheck report, running a new one if a recent one does not exist.
+func (c *Conn) GetLastNetcheckReport(ctx context.Context) *netcheck.Report {
+	lastReport := c.lastNetCheckReport.Load()
+	if lastReport == nil {
+		nr, err := c.updateNetInfo(ctx)
+		if err != nil {
+			c.logf("magicsock.Conn.GetLastNetcheckReport: updateNetInfo: %v", err)
+			return nil
+		}
+		return nr
+	}
+	return lastReport
+}
+
+// SetLastNetcheckReportForTest sets the magicsock conn's last netcheck report.
+// Used for testing purposes.
+func (c *Conn) SetLastNetcheckReportForTest(ctx context.Context, report *netcheck.Report) {
+	c.lastNetCheckReport.Store(report)
+}
+
+// lazyEndpoint is a wireguard conn.Endpoint for when magicsock received a
+// non-disco (presumably WireGuard) packet from a UDP address from which we
+// can't map to a Tailscale peer. But Wireguard most likely can, once it
+// decrypts it. So we implement the conn.PeerAwareEndpoint interface
+// from https://github.com/tailscale/wireguard-go/pull/27 to allow WireGuard
+// to tell us who it is later and get the correct conn.Endpoint.
+type lazyEndpoint struct {
+	c   *Conn
+	src netip.AddrPort
+}
+
+var _ conn.PeerAwareEndpoint = (*lazyEndpoint)(nil)
+var _ conn.Endpoint = (*lazyEndpoint)(nil)
+
+func (le *lazyEndpoint) ClearSrc()           {}
+func (le *lazyEndpoint) SrcIP() netip.Addr   { return le.src.Addr() }
+func (le *lazyEndpoint) DstIP() netip.Addr   { return netip.Addr{} }
+func (le *lazyEndpoint) SrcToString() string { return le.src.String() }
+func (le *lazyEndpoint) DstToString() string { return "dst" }
+func (le *lazyEndpoint) DstToBytes() []byte  { return nil }
+func (le *lazyEndpoint) GetPeerEndpoint(peerPublicKey [32]byte) conn.Endpoint {
+	pubKey := key.NodePublicFromRaw32(mem.B(peerPublicKey[:]))
+	le.c.mu.Lock()
+	defer le.c.mu.Unlock()
+	ep, ok := le.c.peerMap.endpointForNodeKey(pubKey)
+	if !ok {
+		return nil
+	}
+	le.c.logf("magicsock: lazyEndpoint.GetPeerEndpoint(%v) found: %v", pubKey.ShortString(), ep.nodeAddr)
+	return ep
 }

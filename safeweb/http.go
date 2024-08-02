@@ -70,11 +70,14 @@
 package safeweb
 
 import (
+	"cmp"
 	crand "crypto/rand"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 
 	"github.com/gorilla/csrf"
@@ -88,7 +91,7 @@ var defaultCSP = strings.Join([]string{
 	`form-action 'self'`,      // disallow form submissions to other origins
 	`base-uri 'self'`,         // disallow base URIs from other origins
 	`block-all-mixed-content`, // disallow mixed content when serving over HTTPS
-	`object-src 'none'`,       // disallow embedding of resources from other origins
+	`object-src 'self'`,       // disallow embedding of resources from other origins
 }, "; ")
 
 // Config contains the configuration for a safeweb server.
@@ -127,6 +130,10 @@ type Config struct {
 	// unsafe-inline` in the Content-Security-Policy header to permit the use of
 	// inline CSS.
 	CSPAllowInlineStyles bool
+
+	// CookiesSameSiteLax specifies whether to use SameSite=Lax in cookies. The
+	// default is to set SameSite=Strict.
+	CookiesSameSiteLax bool
 }
 
 func (c *Config) setDefaults() error {
@@ -148,48 +155,12 @@ func (c *Config) setDefaults() error {
 	return nil
 }
 
-func (c Config) newHandler() http.Handler {
-	// only set Secure flag on CSRF cookies if we are in a secure context
-	// as otherwise the browser will reject the cookie
-	csrfProtect := csrf.Protect(c.CSRFSecret, csrf.Secure(c.SecureContext))
-
-	var csp string
-	if c.CSPAllowInlineStyles {
-		csp = defaultCSP + `; style-src 'self' 'unsafe-inline'`
-	} else {
-		// if no style-src is provided the browser will fallback to the
-		// default-src directive which disallows inline styles.
-		csp = defaultCSP
-	}
-
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if _, p := c.BrowserMux.Handler(r); p == "" {
-			// disallow x-www-form-urlencoded requests to the API
-			if r.Header.Get("Content-Type") == "application/x-www-form-urlencoded" {
-				http.Error(w, "invalid content type", http.StatusBadRequest)
-				return
-			}
-
-			// set CORS headers for pre-flight OPTIONS requests if any were configured
-			if r.Method == "OPTIONS" && len(c.AccessControlAllowOrigin) > 0 {
-				w.Header().Set("Access-Control-Allow-Origin", strings.Join(c.AccessControlAllowOrigin, ", "))
-				w.Header().Set("Access-Control-Allow-Methods", strings.Join(c.AccessControlAllowMethods, ", "))
-			}
-			c.APIMux.ServeHTTP(w, r)
-			return
-		}
-
-		w.Header().Set("Content-Security-Policy", csp)
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("Referer-Policy", "same-origin")
-		csrfProtect(c.BrowserMux).ServeHTTP(w, r)
-	})
-}
-
 // Server is a safeweb server.
 type Server struct {
 	Config
-	h *http.Server
+	h           *http.Server
+	csp         string
+	csrfProtect func(http.Handler) http.Handler
 }
 
 // NewServer creates a safeweb server with the provided configuration. It will
@@ -208,16 +179,110 @@ func NewServer(config Config) (*Server, error) {
 		return nil, fmt.Errorf("failed to set defaults: %w", err)
 	}
 
-	return &Server{
-		config,
-		&http.Server{Handler: config.newHandler()},
-	}, nil
+	sameSite := csrf.SameSiteStrictMode
+	if config.CookiesSameSiteLax {
+		sameSite = csrf.SameSiteLaxMode
+	}
+	s := &Server{
+		Config: config,
+		csp:    defaultCSP,
+		// only set Secure flag on CSRF cookies if we are in a secure context
+		// as otherwise the browser will reject the cookie
+		csrfProtect: csrf.Protect(config.CSRFSecret, csrf.Secure(config.SecureContext), csrf.SameSite(sameSite)),
+	}
+	if config.CSPAllowInlineStyles {
+		s.csp = defaultCSP + `; style-src 'self' 'unsafe-inline'`
+	}
+	s.h = &http.Server{Handler: s}
+	return s, nil
 }
 
-// RedirectHTTP returns a handler that redirects all incoming HTTP requests to
-// the provided fully qualified domain name (FQDN).
-func (s *Server) RedirectHTTP(fqdn string) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+type handlerType int
+
+const (
+	unknownHandler handlerType = iota
+	apiHandler
+	browserHandler
+)
+
+// checkHandlerType returns either apiHandler or browserHandler, depending on
+// whether apiPattern or browserPattern is more specific (i.e. which pattern
+// contains more pathname components). If they are equally specific, it returns
+// unknownHandler.
+func checkHandlerType(apiPattern, browserPattern string) handlerType {
+	c := cmp.Compare(strings.Count(path.Clean(apiPattern), "/"), strings.Count(path.Clean(browserPattern), "/"))
+	switch {
+	case c > 0:
+		return apiHandler
+	case c < 0:
+		return browserHandler
+	default:
+		return unknownHandler
+	}
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	_, bp := s.BrowserMux.Handler(r)
+	_, ap := s.APIMux.Handler(r)
+	switch {
+	case bp == "" && ap != "": // APIMux match
+		s.serveAPI(w, r)
+	case bp != "" && ap == "": // BrowserMux match
+		s.serveBrowser(w, r)
+	case bp == "" && ap == "": // neither match
+		http.NotFound(w, r)
+	case bp != "" && ap != "":
+		// Both muxes match the path. Route to the more-specific handler (as
+		// determined by the number of components in the path). If it somehow
+		// happens that both patterns are equally specific, something strange
+		// has happened; say so.
+		//
+		// NOTE: checkHandlerType does not know about what the serve* handlers
+		// will do — including, possibly, redirecting to more specific patterns.
+		// If you have a less-specific pattern that redirects to something more
+		// specific, this logic will not do what you wanted.
+		handler := checkHandlerType(ap, bp)
+		switch handler {
+		case apiHandler:
+			s.serveAPI(w, r)
+		case browserHandler:
+			s.serveBrowser(w, r)
+		default:
+			s := http.StatusInternalServerError
+			log.Printf("conflicting mux paths in safeweb: request %q matches browser mux pattern %q and API mux pattern %q; returning %d", r.URL.Path, bp, ap, s)
+			http.Error(w, "multiple handlers match this request", s)
+		}
+	}
+}
+
+func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
+	// disallow x-www-form-urlencoded requests to the API
+	if r.Header.Get("Content-Type") == "application/x-www-form-urlencoded" {
+		http.Error(w, "invalid content type", http.StatusBadRequest)
+		return
+	}
+
+	// set CORS headers for pre-flight OPTIONS requests if any were configured
+	if r.Method == "OPTIONS" && len(s.AccessControlAllowOrigin) > 0 {
+		w.Header().Set("Access-Control-Allow-Origin", strings.Join(s.AccessControlAllowOrigin, ", "))
+		w.Header().Set("Access-Control-Allow-Methods", strings.Join(s.AccessControlAllowMethods, ", "))
+	}
+	s.APIMux.ServeHTTP(w, r)
+}
+
+func (s *Server) serveBrowser(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Security-Policy", s.csp)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Referer-Policy", "same-origin")
+	s.csrfProtect(s.BrowserMux).ServeHTTP(w, r)
+}
+
+// ServeRedirectHTTP serves a single HTTP handler on the provided listener that
+// redirects all incoming HTTP requests to the HTTPS address of the provided
+// fully qualified domain name (FQDN). Callers are responsible for closing the
+// listener.
+func (s *Server) ServeRedirectHTTP(ln net.Listener, fqdn string) error {
+	return http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		new := url.URL{
 			Scheme:   "https",
 			Host:     fqdn,
@@ -226,7 +291,7 @@ func (s *Server) RedirectHTTP(fqdn string) http.Handler {
 		}
 
 		http.Redirect(w, r, new.String(), http.StatusMovedPermanently)
-	})
+	}))
 }
 
 // Serve starts the server and listens on the provided listener. It will block
