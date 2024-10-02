@@ -1139,6 +1139,8 @@ func (b *LocalBackend) WhoIsNodeKey(k key.NodePublic) (n tailcfg.NodeView, u tai
 	return n, u, false
 }
 
+var debugWhoIs = envknob.RegisterBool("TS_DEBUG_WHOIS")
+
 // WhoIs reports the node and user who owns the node with the given IP:port.
 // If the IP address is a Tailscale IP, the provided port may be 0.
 //
@@ -1153,6 +1155,14 @@ func (b *LocalBackend) WhoIs(proto string, ipp netip.AddrPort) (n tailcfg.NodeVi
 	var zero tailcfg.NodeView
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	failf := func(format string, args ...any) (tailcfg.NodeView, tailcfg.UserProfile, bool) {
+		if debugWhoIs() {
+			args = append([]any{proto, ipp}, args...)
+			b.logf("whois(%q, %v) :"+format, args...)
+		}
+		return zero, u, false
+	}
 
 	nid, ok := b.nodeByAddr[ipp.Addr()]
 	if !ok {
@@ -1174,15 +1184,15 @@ func (b *LocalBackend) WhoIs(proto string, ipp netip.AddrPort) (n tailcfg.NodeVi
 			}
 		}
 		if !ok {
-			return zero, u, false
+			return failf("no IP found in ProxyMapper for %v", ipp)
 		}
 		nid, ok = b.nodeByAddr[ip]
 		if !ok {
-			return zero, u, false
+			return failf("no node for proxymapped IP %v", ip)
 		}
 	}
 	if b.netMap == nil {
-		return zero, u, false
+		return failf("no netmap")
 	}
 	n, ok = b.peers[nid]
 	if !ok {
@@ -1194,7 +1204,7 @@ func (b *LocalBackend) WhoIs(proto string, ipp netip.AddrPort) (n tailcfg.NodeVi
 	}
 	u, ok = b.netMap.UserProfiles[n.User()]
 	if !ok {
-		return zero, u, false
+		return failf("no userprofile for node %v", n.Key())
 	}
 	return n, u, true
 }
@@ -4026,7 +4036,7 @@ func (b *LocalBackend) authReconfig() {
 	disableSubnetsIfPAC := nm.HasCap(tailcfg.NodeAttrDisableSubnetsIfPAC)
 	userDialUseRoutes := nm.HasCap(tailcfg.NodeAttrUserDialUseRoutes)
 	dohURL, dohURLOK := exitNodeCanProxyDNS(nm, b.peers, prefs.ExitNodeID())
-	dcfg := dnsConfigForNetmap(nm, b.peers, prefs, b.logf, version.OS())
+	dcfg := dnsConfigForNetmap(nm, b.peers, prefs, b.keyExpired, b.logf, version.OS())
 	// If the current node is an app connector, ensure the app connector machine is started
 	b.reconfigAppConnectorLocked(nm, prefs)
 	b.mu.Unlock()
@@ -4126,10 +4136,23 @@ func shouldUseOneCGNATRoute(logf logger.Logf, controlKnobs *controlknobs.Knobs, 
 //
 // The versionOS is a Tailscale-style version ("iOS", "macOS") and not
 // a runtime.GOOS.
-func dnsConfigForNetmap(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg.NodeView, prefs ipn.PrefsView, logf logger.Logf, versionOS string) *dns.Config {
+func dnsConfigForNetmap(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg.NodeView, prefs ipn.PrefsView, selfExpired bool, logf logger.Logf, versionOS string) *dns.Config {
 	if nm == nil {
 		return nil
 	}
+
+	// If the current node's key is expired, then we don't program any DNS
+	// configuration into the operating system. This ensures that if the
+	// DNS configuration specifies a DNS server that is only reachable over
+	// Tailscale, we don't break connectivity for the user.
+	//
+	// TODO(andrew-d): this also stops returning anything from quad-100; we
+	// could do the same thing as having "CorpDNS: false" and keep that but
+	// not program the OS?
+	if selfExpired {
+		return &dns.Config{}
+	}
+
 	dcfg := &dns.Config{
 		Routes: map[dnsname.FQDN][]*dnstype.Resolver{},
 		Hosts:  map[dnsname.FQDN][]netip.Addr{},
