@@ -1,9 +1,10 @@
 package tsdial
 
-func (d *Dialer) GetDNSMap() dnsMap {
-	d.mu.Lock()
-	dns := d.dns
-	d.mu.Unlock()
+import "net/netip"
 
-	return dns
+func (d *Dialer) ResolveMagicDNS(hostname, network string) (addr netip.Addr, ok bool) {
+	if function := d.resolveMagicDNS.Load(); function != nil {
+		addr, ok = (*function)(hostname, network)
+	}
+	return
 }
