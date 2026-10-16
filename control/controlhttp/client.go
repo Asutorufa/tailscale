@@ -78,6 +78,9 @@ func (a *Dialer) logf(format string, args ...any) {
 }
 
 func (a *Dialer) getProxyFunc() func(*http.Request) (*url.URL, error) {
+	if a.DisableProxy {
+		return nil
+	}
 	if a.proxyFunc != nil {
 		return a.proxyFunc
 	}

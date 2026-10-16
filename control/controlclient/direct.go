@@ -329,6 +329,9 @@ func NewDirect(opts Options) (*Direct, error) {
 		Logf:             opts.Logf,
 	}
 
+	if opts.Dialer.Underlay != nil {
+		dnsCache = opts.Dialer.Underlay.DNSCache
+	}
 	httpc := opts.HTTPTestClient
 	if httpc == nil && runtime.GOOS == "js" {
 		// In js/wasm, net/http.Transport (as of Go 1.18) will
@@ -340,7 +343,7 @@ func NewDirect(opts Options) (*Direct, error) {
 	var interceptedDial *atomic.Bool
 	if httpc == nil {
 		tr := netutil.NewDefaultTransport()
-		if buildfeatures.HasUseProxy {
+		if buildfeatures.HasUseProxy && opts.Dialer.Underlay == nil {
 			tr.Proxy = feature.HookProxyFromEnvironment.GetOrNil()
 			if f, ok := feature.HookProxySetTransportGetProxyConnectHeader.GetOk(); ok {
 				f(tr)

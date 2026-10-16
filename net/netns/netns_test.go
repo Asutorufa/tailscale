@@ -15,6 +15,8 @@ package netns
 
 import (
 	"flag"
+	"net"
+	"tailscale.com/net/netmon"
 	"testing"
 )
 
@@ -74,5 +76,14 @@ func TestIsLocalhost(t *testing.T) {
 		if got := isLocalhost(test.host); got != test.want {
 			t.Errorf("isLocalhost(%q) = %v, want %v", test.name, got, test.want)
 		}
+	}
+}
+
+func TestListenerConcreteAPI(t *testing.T) {
+	nm := netmon.NewStatic()
+	defer nm.Close()
+	var lc *net.ListenConfig = Listener(t.Logf, nm)
+	if lc.Control == nil {
+		t.Fatal("listener lost namespace socket controls")
 	}
 }

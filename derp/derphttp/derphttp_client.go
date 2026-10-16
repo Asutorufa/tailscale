@@ -56,6 +56,10 @@ import (
 // Send/Recv will completely re-establish the connection (unless Close
 // has been called).
 type Client struct {
+	// DialContext optionally replaces all system dials, including region clients.
+	// Set before first use. When set, environment HTTP proxy selection is bypassed.
+	DialContext netx.DialFunc
+
 	TLSConfig     *tls.Config        // optional; nil means default
 	HealthTracker *health.Tracker    // optional; used if non-nil only
 	DNSCache      *dnscache.Resolver // optional; nil means no caching
@@ -606,6 +610,9 @@ func (c *Client) SetURLDialer(dialer netx.DialFunc) {
 
 func (c *Client) dialURL(ctx context.Context) (net.Conn, error) {
 	host := c.url.Hostname()
+	if c.DialContext != nil {
+		return c.DialContext(ctx, "tcp", net.JoinHostPort(host, urlPort(c.url)))
+	}
 	if c.dialer != nil {
 		return c.dialer(ctx, "tcp", net.JoinHostPort(host, urlPort(c.url)))
 	}
@@ -712,6 +719,9 @@ func (c *Client) DialRegionTLS(ctx context.Context, reg *tailcfg.DERPRegion) (tl
 }
 
 func (c *Client) dialContext(ctx context.Context, proto, addr string) (net.Conn, error) {
+	if c.DialContext != nil {
+		return c.DialContext(ctx, proto, addr)
+	}
 	return netns.NewDialer(c.logf, c.netMon).DialContext(ctx, proto, addr)
 }
 
@@ -745,7 +755,7 @@ func (c *Client) dialNode(ctx context.Context, n *tailcfg.DERPNode) (net.Conn, e
 			Path:   "/", // unused
 		},
 	}
-	if buildfeatures.HasUseProxy {
+	if buildfeatures.HasUseProxy && c.DialContext == nil {
 		if proxyFromEnv, ok := feature.HookProxyFromEnvironment.GetOk(); ok {
 			if proxyURL, err := proxyFromEnv(proxyReq); err == nil && proxyURL != nil {
 				return c.dialNodeUsingProxy(ctx, n, proxyURL)

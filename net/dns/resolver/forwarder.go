@@ -513,6 +513,9 @@ func (f *forwarder) setRoutes(routesBySuffix map[dnsname.FQDN][]*dnstype.Resolve
 var stdNetPacketListener nettype.PacketListenerWithNetIP = nettype.MakePacketListenerWithNetIP(new(net.ListenConfig))
 
 func (f *forwarder) packetListener(ip netip.Addr) (nettype.PacketListenerWithNetIP, error) {
+	if f.dialer.Underlay != nil {
+		return f.dialer.Underlay.PacketListener, nil
+	}
 	if f.linkSel == nil || initListenConfig == nil {
 		return stdNetPacketListener, nil
 	}

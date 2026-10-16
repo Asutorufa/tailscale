@@ -245,6 +245,7 @@ func (nc *Client) dial(ctx context.Context) (*Conn, error) {
 	defer cancel()
 
 	chd := &controlhttp.Dialer{
+		DisableProxy:    nc.opts.Dialer.Underlay != nil,
 		Hostname:        nc.host,
 		HTTPPort:        nc.httpPort,
 		HTTPSPort:       cmp.Or(nc.httpsPort, controlhttp.NoPort),

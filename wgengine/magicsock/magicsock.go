@@ -165,6 +165,7 @@ type Conn struct {
 	epFunc                 func([]tailcfg.Endpoint)
 	derpActiveFunc         func()
 	idleFunc               func() time.Duration // nil means unknown
+	underlay               *netns.Underlay
 	testOnlyPacketListener nettype.PacketListener
 	onDERPRecv             func(tailcfg.DERPRegionID, key.NodePublic, []byte) bool // or nil, see Options.OnDERPRecv
 	netMon                 *netmon.Monitor                                         // must be non-nil
@@ -447,6 +448,9 @@ func (c *Conn) dlogf(format string, a ...any) {
 
 // Options contains options for Listen.
 type Options struct {
+	// Underlay optionally replaces system TCP, UDP and DNS for this instance.
+	Underlay *netns.Underlay
+
 	// EventBus, if non-nil, is used for event publication and subscription by
 	// each Conn created from these Options. It must not be nil outside of
 	// tests.
@@ -656,6 +660,7 @@ func NewConn(opts Options) (*Conn, error) {
 	c.epFunc = opts.endpointsFunc()
 	c.derpActiveFunc = opts.derpActiveFunc()
 	c.idleFunc = opts.IdleFunc
+	c.underlay = opts.Underlay
 	c.testOnlyPacketListener = opts.TestOnlyPacketListener
 	c.onDERPRecv = opts.OnDERPRecv
 
@@ -678,7 +683,7 @@ func NewConn(opts Options) (*Conn, error) {
 
 	// Don't log the same log messages possibly every few seconds in our
 	// portmapper.
-	if buildfeatures.HasPortMapper && !opts.DisablePortMapper {
+	if buildfeatures.HasPortMapper && !opts.DisablePortMapper && c.underlay == nil {
 		portmapperLogf := logger.WithPrefix(c.logf, "portmapper: ")
 		portmapperLogf = netmon.LinkChangeLogLimiter(c.connCtx, portmapperLogf, opts.NetMon)
 		var disableUPnP func() bool
@@ -708,6 +713,7 @@ func NewConn(opts Options) (*Conn, error) {
 	}
 
 	c.netChecker = &netcheck.Client{
+		Underlay:            c.underlay,
 		Logf:                logger.WithPrefix(c.logf, "netcheck: "),
 		NetMon:              c.netMon,
 		SendPacket:          c.sendUDPNetcheck,
@@ -721,7 +727,7 @@ func NewConn(opts Options) (*Conn, error) {
 		c.homeDERPGauge = opts.Metrics.NewGauge("tailscaled_home_derp_region_id", "DERP region ID of this node's home relay server")
 	}
 
-	if hasUDPTransport {
+	if hasUDPTransport && c.underlay == nil {
 		if d4, err := c.listenRawDisco("ip4"); err == nil {
 			c.logf("[v1] using BPF disco receiver for IPv4")
 			c.closeDisco4 = d4
@@ -3747,6 +3753,9 @@ func (c *Conn) listenPacket(network string, port uint16) (nettype.PacketConn, er
 		ctx = sockstats.WithSockStats(ctx, sockstats.LabelMagicsockConnUDP6, c.logf)
 	}
 	addr := net.JoinHostPort("", fmt.Sprint(port))
+	if c.underlay != nil {
+		return c.underlay.PacketListener.ListenPacket(ctx, network, addr)
+	}
 	if c.testOnlyPacketListener != nil {
 		return nettype.MakePacketListenerWithNetIP(c.testOnlyPacketListener).ListenPacket(ctx, network, addr)
 	}
@@ -4122,7 +4131,7 @@ const indexSentinelDeleted = -1
 // getPinger lazily instantiates a pinger and returns it, if it was
 // already instantiated it returns the existing one.
 func (c *Conn) getPinger() *ping.Pinger {
-	if !hasUDPTransport {
+	if !hasUDPTransport || c.underlay != nil {
 		return nil
 	}
 	return c.wgPinger.Get(func() *ping.Pinger {
