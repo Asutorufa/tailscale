@@ -637,6 +637,14 @@ func (d *Dialer) dialOneUser(ctx context.Context, network string, ipp netip.Addr
 		return d.SystemDial(ctx, network, ipp.String())
 	}
 
+	// An explicitly supplied Underlay is the owner's network boundary.
+	// In particular, embedded DNS can call UserDial with no routes installed,
+	// or after a route was revoked. Never fall back to net.Dialer here:
+	// that bypasses the host's outbound policy and can leak DNS traffic.
+	if d.Underlay != nil {
+		return d.SystemDial(ctx, network, ipp.String())
+	}
+
 	// Workaround for macOS for now: dial Tailscale IPs with peer dialer.
 	// TODO(bradfitz): fix dialing subnet routers, public IPs via exit nodes,
 	// etc. This is a temporary partial for macOS. We need to plumb ART tables &
