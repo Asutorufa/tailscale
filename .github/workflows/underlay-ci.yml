@@ -1,0 +1,21 @@
+name: TSDial Underlay regression
+on:
+  push:
+    branches: [fix/tsdial-always-use-explicit-underlay]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  tsdial:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Validate formatting
+        run: test -z "$(gofmt -l net/tsdial/tsdial.go net/tsdial/underlay_test.go)"
+      - name: Race-test explicit Underlay behavior
+        run: go test -race -count=2 -timeout=180s ./net/tsdial
