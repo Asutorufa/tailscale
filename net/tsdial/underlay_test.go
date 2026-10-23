@@ -63,3 +63,40 @@ func TestMagicDNSPlanCanonicalization(t *testing.T) {
 		}
 	}
 }
+
+func TestUserDialWithoutRoutesHonorsExplicitUnderlay(t *testing.T) {
+	for _, target := range []struct {
+		network string
+		address string
+	}{
+		{"tcp4", "198.51.100.53:443"},
+		{"tcp6", "[2001:db8::53]:443"},
+	} {
+		t.Run(target.network, func(t *testing.T) {
+			nm := netmon.NewStatic()
+			defer nm.Close()
+			d := NewDialer(nm)
+			defer d.Close()
+			var called bool
+			d.Underlay = &netns.Underlay{
+				DialContext: func(_ context.Context, network, address string) (net.Conn, error) {
+					called = true
+					if network != target.network || address != target.address {
+						t.Errorf("Underlay dial = %s %s, want %s %s", network, address, target.network, target.address)
+					}
+					local, remote := net.Pipe()
+					t.Cleanup(func() { _ = remote.Close() })
+					return local, nil
+				},
+			}
+			conn, err := d.UserDial(t.Context(), target.network, target.address)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = conn.Close()
+			if !called {
+				t.Fatal("UserDial bypassed explicit Underlay with no routes configured")
+			}
+		})
+	}
+}
