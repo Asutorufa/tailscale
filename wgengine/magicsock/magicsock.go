@@ -3620,6 +3620,7 @@ func (c *Conn) Close() error {
 	})
 
 	c.closed = true
+	c.muCond.Broadcast()
 	c.connCtxCancel()
 	c.closeAllDerpLocked("conn-close")
 	// Ignore errors from c.pconnN.Close.
