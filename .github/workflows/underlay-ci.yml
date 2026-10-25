@@ -1,6 +1,8 @@
 name: TSDial Underlay regression
 on:
   push:
+    branches: [fix/tsdial-always-use-explicit-underlay, codex/await-initial-endpoint-update]
+  pull_request:
     branches: [fix/tsdial-always-use-explicit-underlay]
   workflow_dispatch:
 permissions:
@@ -19,3 +21,8 @@ jobs:
         run: test -z "$(gofmt -l net/tsdial/tsdial.go net/tsdial/underlay_test.go)"
       - name: Race-test explicit Underlay behavior
         run: go test -race -count=2 -timeout=180s ./net/tsdial
+
+      - name: Validate endpoint-update synchronization
+        run: |
+          test -z "$(gofmt -l wgengine/magicsock/endpoint_update*.go)"
+          go test -race -count=20 -timeout=180s -run '^TestAwaitEndpointUpdates$' ./wgengine/magicsock
