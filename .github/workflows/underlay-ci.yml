@@ -1,0 +1,44 @@
+name: Tailscale Lite Underlay
+on:
+  push:
+    branches: [codex/tailscale-lite-underlay]
+  pull_request:
+    branches: [codex/tailscale-lite-underlay]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  underlay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Validate formatting
+        run: test -z "$(git diff --name-only HEAD^ HEAD -- '*.go' | xargs gofmt -l)"
+      - name: Race-test dialer and netcheck
+        run: go test -race -count=2 -timeout=180s ./net/tsdial ./net/netcheck
+      - name: Validate endpoint updates and UDP socket groups
+        run: |
+          test -z "$(gofmt -l wgengine/magicsock/endpoint_update*.go)"
+          go test -race -count=20 -timeout=180s -run '^Test(AwaitEndpointUpdates|UDPSockets.*)$' ./wgengine/magicsock
+      - uses: actions/checkout@v4
+        with:
+          repository: yuhaiin/tailscale-lite
+          ref: 90aa35361b1f56e29e7c4c7446ea8acd06db96f9
+          path: lite-consumer
+      - name: Validate the lite consumer
+        working-directory: lite-consumer
+        run: |
+          go mod edit -replace="tailscale.com=$GITHUB_WORKSPACE"
+          go test -mod=mod -race -tags=integration,ts_omit_netstack,ts_omit_gro -timeout=180s ./...
+          go list -mod=mod -tags=ts_omit_netstack,ts_omit_gro -deps ./... > deps.txt
+          if grep -Eq '^(gvisor.dev/gvisor|tailscale.com/(tsnet|ipn/ipnlocal))(/|$)' deps.txt; then
+            echo 'lite consumer unexpectedly imports tsnet, ipnlocal or gVisor'
+            exit 1
+          fi

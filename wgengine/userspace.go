@@ -427,6 +427,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		e.RequestStatus()
 	}
 	magicsockOpts := magicsock.Options{
+		Underlay:       conf.Dialer.Underlay,
 		EventBus:       e.eventBus,
 		Logf:           logf,
 		Port:           conf.ListenPort,
