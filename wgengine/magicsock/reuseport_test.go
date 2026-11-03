@@ -10,6 +10,7 @@ import (
 	"slices"
 	"testing"
 
+	"tailscale.com/net/netns"
 	"tailscale.com/tstest"
 	"tailscale.com/types/nettype"
 )
@@ -46,11 +47,13 @@ func TestUDPSocketsOne(t *testing.T) {
 		name     string
 		sockets  int
 		listener nettype.PacketListener
+		underlay *netns.Underlay
 		noReuse  bool // clear canShareUDPPort
 	}{
 		{name: "unset", sockets: 0},
 		{name: "negative", sockets: -3},
 		{name: "test-only-listener", sockets: 4, listener: localhostListener{}},
+		{name: "underlay", sockets: 4, underlay: &netns.Underlay{PacketListener: nettype.MakePacketListenerWithNetIP(localhostListener{})}},
 		{name: "no-reuseport", sockets: 4, noReuse: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -60,10 +63,15 @@ func TestUDPSocketsOne(t *testing.T) {
 			c, _ := newTestConnAndRegistry(t, func(o *Options) {
 				o.UDPSockets = tt.sockets
 				o.TestOnlyPacketListener = tt.listener
+				o.Underlay = tt.underlay
 			})
 
 			if got := c.pconn4.group.bound; got != 1 {
 				t.Errorf("bound %d sockets, want 1", got)
+			}
+			boundPort := c.pconn4.currentConn(0).LocalAddr().(*net.UDPAddr).Port
+			if boundPort == 0 || c.pconn4.Port() != uint16(boundPort) {
+				t.Fatalf("reported port %d differs from allocated port %d", c.pconn4.Port(), boundPort)
 			}
 			if _, _, err := c.bind.Open(0); err != nil {
 				t.Fatal(err)

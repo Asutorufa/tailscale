@@ -65,7 +65,10 @@ func NewFromFuncForDebug(logf logger.Logf, dial netx.DialFunc) *Dialer {
 //
 // Before use, SetNetMon should be called with a netmon.Monitor.
 type Dialer struct {
-	Logf logger.Logf
+	// Underlay optionally replaces system networking for this instance.
+	// It must be configured before first use and remain immutable.
+	Underlay *netns.Underlay
+	Logf     logger.Logf
 	// UseNetstackForIP if non-nil is whether NetstackDialTCP (if
 	// it's non-nil) should be used to dial the provided IP.
 	UseNetstackForIP func(netip.Addr) bool
@@ -485,7 +488,11 @@ func (d *Dialer) userDialResolveAll(ctx context.Context, network, addr string) (
 			}
 		}
 
-		ips, err := r.LookupIP(ctx, ipNetOfNetwork(network), host)
+		lookup := &r
+		if r.Dial == nil && d.Underlay != nil && d.Underlay.DNSCache.Forward != nil {
+			lookup = d.Underlay.DNSCache.Forward
+		}
+		ips, err := lookup.LookupIP(ctx, ipNetOfNetwork(network), host)
 		if err != nil {
 			return nil, err
 		}
@@ -581,7 +588,9 @@ func (d *Dialer) SystemDial(ctx context.Context, network, addr string) (net.Conn
 
 	var c net.Conn
 	var err error
-	if d.sysDialForTest != nil {
+	if d.Underlay != nil {
+		c, err = d.Underlay.DialContext(ctx, network, addr)
+	} else if d.sysDialForTest != nil {
 		c, err = d.sysDialForTest(ctx, network, addr)
 	} else {
 		d.netnsDialerOnce.Do(func() {
@@ -594,6 +603,10 @@ func (d *Dialer) SystemDial(ctx context.Context, network, addr string) (net.Conn
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.closed {
+		c.Close()
+		return nil, net.ErrClosed
+	}
 	id := d.nextSysConnID
 	d.nextSysConnID++
 	mak.Set(&d.activeSysConns, id, c)
@@ -649,6 +662,14 @@ func (d *Dialer) dialOneUser(ctx context.Context, network string, ipp netip.Addr
 			return d.getPeerDialer().DialContext(ctx, network, ipp.String())
 		}
 
+		return d.SystemDial(ctx, network, ipp.String())
+	}
+
+	// An explicitly supplied Underlay is the owner's network boundary.
+	// In particular, embedded DNS can call UserDial with no routes installed,
+	// or after a route was revoked. Never fall back to net.Dialer here:
+	// that bypasses the host's outbound policy and can leak DNS traffic.
+	if d.Underlay != nil {
 		return d.SystemDial(ctx, network, ipp.String())
 	}
 

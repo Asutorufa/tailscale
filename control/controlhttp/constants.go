@@ -33,6 +33,9 @@ const NoPort = "none"
 
 // Dialer contains configuration on how to dial the Tailscale control server.
 type Dialer struct {
+	// DisableProxy bypasses environment proxies for an explicitly supplied underlay.
+	DisableProxy bool
+
 	// Hostname is the hostname to connect to, with no port number.
 	//
 	// This field is required.

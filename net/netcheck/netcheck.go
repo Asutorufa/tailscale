@@ -220,6 +220,9 @@ func (lat RegionLatency) Compare(i, j tailcfg.DERPRegionID) int {
 // active probes, and must receive STUN packet replies via ReceiveSTUNPacket.
 // Client can be used in a standalone fashion via the Standalone method.
 type Client struct {
+	// Underlay optionally supplies system networking for an embedded server.
+	Underlay *netns.Underlay
+
 	// NetMon is the netmon.Monitor to use to get the current
 	// (cached) network interface.
 	// It must be non-nil.
@@ -925,7 +928,7 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 
 	// See if IPv6 works at all, or if it's been hard disabled at the
 	// OS level.
-	v6udp, err := nettype.MakePacketListenerWithNetIP(netns.Listener(c.logf, c.NetMon)).ListenPacket(ctx, "udp6", "[::1]:0")
+	v6udp, err := c.packetListener().ListenPacket(ctx, "udp6", "[::1]:0")
 	if err == nil {
 		rs.report.OSHasIPv6 = true
 		v6udp.Close()
@@ -948,7 +951,7 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 	// it's unnecessary.
 	captivePortalDone := syncs.ClosedChan()
 	captivePortalStop := func() {}
-	if buildfeatures.HasCaptivePortal && !rs.incremental && !onlySTUN {
+	if buildfeatures.HasCaptivePortal && !rs.incremental && !onlySTUN && c.Underlay == nil {
 		if start, ok := HookStartCaptivePortalDetection.GetOk(); ok {
 			captivePortalDone, captivePortalStop = start(ctx, c, dm, preferredDERP, func(found bool) {
 				rs.report.CaptivePortal.Set(found)
@@ -1154,6 +1157,10 @@ func (c *Client) measureHTTPSLatency(ctx context.Context, reg *tailcfg.DERPRegio
 	var ip netip.Addr
 
 	dc := derphttp.NewNetcheckClient(c.logf, c.NetMon)
+	if c.Underlay != nil {
+		dc.DialContext = c.Underlay.DialContext
+		dc.DNSCache = c.Underlay.DNSCache
+	}
 	defer dc.Close()
 
 	// DialRegionTLS may dial multiple times if a node is not available, as such
@@ -1228,7 +1235,7 @@ func (c *Client) measureHTTPSLatency(ctx context.Context, reg *tailcfg.DERPRegio
 }
 
 func (c *Client) measureAllICMPLatency(ctx context.Context, rs *reportState, need []*tailcfg.DERPRegion) error {
-	if len(need) == 0 {
+	if len(need) == 0 || c.Underlay != nil {
 		return nil
 	}
 	if runtime.GOOS == "plan9" {
@@ -1708,6 +1715,18 @@ func (c *Client) nodeAddrPort(ctx context.Context, n *tailcfg.DERPNode, port int
 	}
 
 	// The default lookup function if we don't set UseDNSCache is to use net.DefaultResolver.
+	if c.Underlay != nil {
+		_, _, ips, err := c.Underlay.DNSCache.LookupIP(ctx, n.HostName)
+		for _, ip := range ips {
+			if proto == probeIPv4 && ip.Is4() || proto == probeIPv6 && ip.Is6() {
+				return netip.AddrPortFrom(ip, uint16(port)), true
+			}
+		}
+		if err != nil {
+			c.logf("netcheck: DNS lookup: %v", err)
+		}
+		return zero, false
+	}
 	lookupIPAddr := func(ctx context.Context, host string) ([]netip.Addr, error) {
 		addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 		if err != nil {
@@ -1798,3 +1817,11 @@ var (
 	metricSTUNRecv6 = clientmetric.NewCounter("netcheck_stun_recv_ipv6")
 	metricHTTPSend  = clientmetric.NewCounter("netcheck_https_measure")
 )
+
+// packetListener keeps standalone probes on the same transport as magicsock.
+func (c *Client) packetListener() nettype.PacketListenerWithNetIP {
+	if c.Underlay != nil {
+		return c.Underlay.PacketListener
+	}
+	return nettype.MakePacketListenerWithNetIP(netns.Listener(c.logf, c.NetMon))
+}

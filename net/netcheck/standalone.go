@@ -9,7 +9,6 @@ import (
 	"net/netip"
 
 	"tailscale.com/net/netaddr"
-	"tailscale.com/net/netns"
 	"tailscale.com/net/stun"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/nettype"
@@ -31,7 +30,7 @@ func (c *Client) Standalone(ctx context.Context, bindAddr string) error {
 	}
 	var errs []error
 
-	u4, err := nettype.MakePacketListenerWithNetIP(netns.Listener(c.logf, c.NetMon)).ListenPacket(ctx, "udp4", bindAddr)
+	u4, err := c.packetListener().ListenPacket(ctx, "udp4", bindAddr)
 	if err != nil {
 		c.logf("udp4: %v", err)
 		errs = append(errs, err)
@@ -39,7 +38,7 @@ func (c *Client) Standalone(ctx context.Context, bindAddr string) error {
 		go readPackets(ctx, c.logf, u4, c.ReceiveSTUNPacket)
 	}
 
-	u6, err := nettype.MakePacketListenerWithNetIP(netns.Listener(c.logf, c.NetMon)).ListenPacket(ctx, "udp6", bindAddr)
+	u6, err := c.packetListener().ListenPacket(ctx, "udp6", bindAddr)
 	if err != nil {
 		c.logf("udp6: %v", err)
 		errs = append(errs, err)
