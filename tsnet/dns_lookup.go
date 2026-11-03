@@ -29,6 +29,10 @@ type dnsResolver struct {
 
 	// searchDomains returns the current tailnet search domains in order.
 	searchDomains func() []dnsname.FQDN
+
+	// hostLookupIP overrides host fallback for an instance-specific underlay.
+	// A nil callback uses net.DefaultResolver.
+	hostLookupIP func(context.Context, string, string) ([]net.IP, error)
 }
 
 // lookupIP resolves host according to [Server.LookupIP].
@@ -228,9 +232,13 @@ func (c *dnsResolver) lookupCandidate(ctx context.Context, network string, name 
 	}
 }
 
-// hostLookup resolves name using net.DefaultResolver.
+// hostLookup resolves name using the instance fallback or net.DefaultResolver.
 func (c *dnsResolver) hostLookup(ctx context.Context, network string, name string) candidateResult {
-	stdIPs, err := net.DefaultResolver.LookupIP(ctx, network, name)
+	lookup := c.hostLookupIP
+	if lookup == nil {
+		lookup = net.DefaultResolver.LookupIP
+	}
+	stdIPs, err := lookup(ctx, network, name)
 	if err != nil {
 		var dnsErr *net.DNSError
 		if errors.As(err, &dnsErr) && dnsErr.IsNotFound {

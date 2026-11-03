@@ -5,6 +5,8 @@ package tsnet
 
 import (
 	"context"
+	"errors"
+	"net"
 	"net/netip"
 	"sync"
 
@@ -48,7 +50,7 @@ func (s *Server) dnsResolver() *dnsResolver {
 			searchMap  *netmap.NetworkMap // immutable source of searchList
 			searchList []dnsname.FQDN
 		)
-		return &dnsResolver{
+		res := &dnsResolver{
 			queryDNS: func(ctx context.Context, name dnsname.FQDN, qtype dnsmessage.Type) ([]byte, bool, error) {
 				bs, _, err := s.lb.QueryDNS(ctx, name.WithoutTrailingDot(), qtype)
 				return bs, s.hasConfiguredDNSRoute(name), err
@@ -64,6 +66,15 @@ func (s *Server) dnsResolver() *dnsResolver {
 				return searchList
 			},
 		}
+		if u := s.Underlay; u != nil {
+			res.hostLookupIP = func(ctx context.Context, network, host string) ([]net.IP, error) {
+				if u.DNSCache.Forward == nil {
+					return nil, errors.New("tsnet: Underlay DNS fallback resolver is unavailable")
+				}
+				return u.DNSCache.Forward.LookupIP(ctx, network, host)
+			}
+		}
+		return res
 	})
 }
 

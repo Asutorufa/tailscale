@@ -206,8 +206,10 @@ import (
 	"tailscale.com/logpolicy"
 	"tailscale.com/logtail"
 	"tailscale.com/logtail/filch"
+	"tailscale.com/net/dnscache"
 	"tailscale.com/net/memnet"
 	"tailscale.com/net/netmon"
+	"tailscale.com/net/netns"
 	"tailscale.com/net/netx"
 	"tailscale.com/net/proxymux"
 	"tailscale.com/net/socks5"
@@ -369,6 +371,10 @@ type Server struct {
 	//
 	// This field must be set before calling Start.
 	Tun tun.Device
+
+	// Underlay optionally provides instance-specific system TCP, UDP and DNS.
+	// Configure it before Start; see netns.Underlay for transport requirements.
+	Underlay *netns.Underlay
 
 	initOnce            sync.Once
 	initErr             error
@@ -873,6 +879,9 @@ func (s *Server) getAudience() string {
 }
 
 func (s *Server) start() (reterr error) {
+	if u := s.Underlay; u != nil && (u.DialContext == nil || u.PacketListener == nil || u.DNSCache == nil) {
+		return errors.New("tsnet: Underlay requires DialContext, PacketListener and DNSCache")
+	}
 	var closePool closeOnErrorPool
 	defer closePool.closeAllIfError(&reterr)
 
@@ -952,7 +961,7 @@ func (s *Server) start() (reterr error) {
 	}
 	closePool.add(s.netMon)
 
-	s.dialer = &tsdial.Dialer{Logf: tsLogf} // mutated below (before used)
+	s.dialer = &tsdial.Dialer{Logf: tsLogf, Underlay: s.Underlay} // mutated below (before used)
 	s.dialer.SetBus(sys.Bus.Get())
 	s.dialer.SetSystemDialer(s.SystemDial)
 	// LookupIP handles names not resolved by the MagicDNS hook.
@@ -1196,6 +1205,11 @@ func (s *Server) startLogger(closePool *closeOnErrorPool, health *health.Tracker
 		return fmt.Errorf("error creating filch: %w", err)
 	}
 	closePool.add(s.logbuffer)
+	transport := logpolicy.NewLogtailTransport(logtail.DefaultHost, s.netMon, health, tsLogf)
+	if tr, ok := transport.(*http.Transport); ok && s.Underlay != nil {
+		tr.Proxy = nil
+		tr.DialContext = dnscache.Dialer(s.Underlay.DialContext, s.Underlay.DNSCache)
+	}
 	c := logtail.Config{
 		Collection:   lpc.Collection,
 		PrivateID:    lpc.PrivateID,
@@ -1203,7 +1217,7 @@ func (s *Server) startLogger(closePool *closeOnErrorPool, health *health.Tracker
 		Buffer:       s.logbuffer,
 		CompressLogs: true,
 		Bus:          s.sys.Bus.Get(),
-		HTTPC:        &http.Client{Transport: logpolicy.NewLogtailTransport(logtail.DefaultHost, s.netMon, health, tsLogf)},
+		HTTPC:        &http.Client{Transport: transport},
 		MetricsDelta: clientmetric.EncodeLogTailMetricsDelta,
 	}
 	s.logtail = logtail.NewLogger(c, tsLogf)
