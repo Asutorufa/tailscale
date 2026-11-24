@@ -3935,7 +3935,7 @@ func (c *Conn) listenGroup(network string, port uint16) (_ []nettype.PacketConn,
 		ctx,
 		logger.WithPrefix(c.logf, "magicsock: "+network+": "),
 		c.udpSockets,
-		netns.Listener(c.logf, c.netMon).Control,
+		netns.ListenControl(c.logf, c.netMon),
 		network,
 		port,
 	)

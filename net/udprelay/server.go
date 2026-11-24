@@ -628,9 +628,8 @@ func trySetSOMark(logf logger.Logf, netMon *netmon.Monitor, network, address str
 		// running on Linux and SO_MARK is unavailable (EPERM), chances are
 		// there is no TUN device, so routing over Tailscale is impossible
 		// anyway. Both TUN creation and SO_MARK require CAP_NET_ADMIN.
-		lis := netns.Listener(logf, netMon)
-		if lis.Control != nil {
-			lis.Control(network, address, c)
+		if control := netns.ListenControl(logf, netMon); control != nil {
+			control(network, address, c)
 		}
 	}
 }

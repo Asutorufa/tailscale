@@ -102,6 +102,20 @@ func Listener(logf logger.Logf, netMon *netmon.Monitor) ListenerInterface {
 	return l
 }
 
+// ListenControl returns the socket Control hook that Listener would install
+// on its net.ListenConfig, or nil if netns is disabled. Unlike Listener, it
+// bypasses any wrapper installed by SetWrapListener, since it only sets
+// socket options on an already-created socket.
+func ListenControl(logf logger.Logf, netMon *netmon.Monitor) func(network, address string, c syscall.RawConn) error {
+	if netMon == nil {
+		panic("netns.ListenControl called with nil netMon")
+	}
+	if disabled.Load() {
+		return nil
+	}
+	return control(logf, netMon)
+}
+
 // NewDialer returns a new Dialer using a net.Dialer with its ControlContext
 // hook func initialized as necessary to run in a logical network
 // namespace that doesn't route back into Tailscale. It also handles
